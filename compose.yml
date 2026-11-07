@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    container_name: wageringDatabase
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydatabase
+    volumes:
+      - wagering-data:/var/lib/postgresql/data
+
+volumes:
+  wagering-data:

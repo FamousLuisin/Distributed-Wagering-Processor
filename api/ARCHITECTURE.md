@@ -69,3 +69,25 @@ documentada.
 O fluxo financeiro será orquestrado por um caso de uso de `wagering`, usando
 uma transação MikroORM para persistir transação, wallet, ledger, inbox (quando
 aplicável) e outbox de forma atômica.
+
+## Regras de transação e ledger
+
+`WagerTransaction` nasce em `PENDING`. As transições permitidas são:
+
+```text
+PENDING -> PENDING_REFERENCE | PROCESSED | REJECTED | FAILED
+PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED
+```
+
+`PROCESSED`, `REJECTED` e `FAILED` são terminais. `OPENING` usa uma factory
+interna separada e nasce `PROCESSED`; a API/fila deve aceitar somente os tipos
+externos. O agregado valida exigência de referência, estado terminal, hash de
+payload e direção contábil. A validação de ownership da referência, rodada,
+valor, duplicidade de reversão e saldo cabe ao caso de uso que tem acesso aos
+repositórios e à wallet.
+
+`WalletLedgerEntry` é imutável. A factory exige valor positivo, moeda igual em
+valor e saldos, saldo final não negativo e aritmética consistente: débito subtrai
+o valor e crédito soma. `LOSS` não gera lançamento. `ROLLBACK` inverte a direção
+do BET/WIN/REFUND processado que referencia. A restrição de um lançamento por
+transação/wallet também será aplicada por índice único no banco.
