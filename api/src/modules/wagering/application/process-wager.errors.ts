@@ -48,3 +48,17 @@ export class InvalidWagerAmountError extends Error {
     this.name = 'InvalidWagerAmountError';
   }
 }
+
+export class InboxMessagePayloadConflictError extends Error {
+  constructor() {
+    super('Inbox message ID was reused with a different payload');
+    this.name = 'InboxMessagePayloadConflictError';
+  }
+}
+
+export class InboxMessageWithoutWagerError extends Error {
+  constructor() {
+    super('Processed inbox message has no corresponding wager transaction');
+    this.name = 'InboxMessageWithoutWagerError';
+  }
+}

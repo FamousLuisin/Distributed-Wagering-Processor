@@ -3,6 +3,8 @@ import { defineConfig } from '@mikro-orm/postgresql';
 import { WalletLedgerEntryEntitySchema } from '../modules/ledger/infrastructure/wallet-ledger-entry.entity.js';
 import { WagerTransactionEntitySchema } from '../modules/wagering/infrastructure/wager-transaction.entity.js';
 import { WalletEntitySchema } from '../modules/wallets/infrastructure/wallet.entity.js';
+import { InboxMessageEntitySchema } from '../modules/messaging/infrastructure/inbox-message.entity.js';
+import { OutboxMessageEntitySchema } from '../modules/messaging/infrastructure/outbox-message.entity.js';
 
 export default defineConfig({
   host: process.env.DB_HOST ?? 'localhost',
@@ -14,6 +16,8 @@ export default defineConfig({
     WalletEntitySchema,
     WagerTransactionEntitySchema,
     WalletLedgerEntryEntitySchema,
+    InboxMessageEntitySchema,
+    OutboxMessageEntitySchema,
   ],
   extensions: [Migrator],
   migrations: {

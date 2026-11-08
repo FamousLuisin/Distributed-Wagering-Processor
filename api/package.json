@@ -27,6 +27,7 @@
     "db:migration:check": "mikro-orm migration:check --config ./src/database/mikro-orm.config.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1164.0",
     "@mikro-orm/core": "^7.2.0",
     "@mikro-orm/migrations": "^7.2.0",
     "@mikro-orm/nestjs": "^7.1.0",

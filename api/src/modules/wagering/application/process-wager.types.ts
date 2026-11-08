@@ -6,6 +6,15 @@ import type {
 } from '../domain/wager-transaction.types.js';
 
 export interface ProcessWagerProps {
+  /** Transport metadata; excluded from the business payload hash. */
+  correlationId?: string;
+  causationId?: string;
+  inboxMessage?: {
+    messageId: string;
+    consumerName: string;
+    payloadHash: string;
+    receivedAt?: Date;
+  };
   providerId: string;
   externalTransactionId: string;
   idempotencyKey: string;

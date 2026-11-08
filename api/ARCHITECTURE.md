@@ -75,9 +75,10 @@ aplicável) e outbox de forma atômica.
 Os `EntitySchema` ficam nas camadas de infraestrutura e mantêm o domínio sem
 dependência do ORM. `Money` é persistido como `numeric(20,2)` e moeda em coluna
 separada; o valor numérico é lido/escrito como string decimal. A versão da wallet
-é a versão otimista do MikroORM. As garantias de unicidade, saldo não negativo,
-aritmética do ledger e ledger append-only também estão na migration SQL, para
-continuarem valendo com mais de uma instância.
+é incrementada no domínio; a concorrência entre operações usa lock pessimista
+por wallet. As garantias de unicidade, saldo não negativo, aritmética do ledger
+e ledger append-only também estão na migration SQL, para continuarem valendo
+com mais de uma instância.
 
 A primeira migration cria `wallets`, `wager_transactions` e
 `wallet_ledger_entries`. A migration seguinte adiciona o snapshot
@@ -122,6 +123,55 @@ retornam `200`, operações aguardando referência retornam `202`. Payload invá
 retorna `400`, conflitos de idempotência/ID externo retornam `409`, wallet
 ausente retorna `404` e incompatibilidades de jogador/moeda retornam `422`. A
 autenticação permanece fora do escopo, conforme decisão da seção 2 do desafio.
+
+## Outbox e eventos de integração
+
+A migration `Migration20261109000000` cria `inbox_messages` com chave composta
+`(consumer_name, message_id)` e `outbox_messages` com payload JSONB, tentativas,
+próxima tentativa, publicação e lease de publisher. A inbox e seu modelo de
+domínio estão prontos para deduplicação pelo consumer; ainda não são escritos
+porque o consumer SQS será implementado na próxima etapa.
+
+`ProcessWager` cria um evento tipado e sua linha de outbox dentro da mesma
+transação PostgreSQL que grava a wager, atualiza a wallet e persiste o ledger.
+Resultados `PROCESSED`, `REJECTED` e `PENDING_REFERENCE` geram respectivamente
+`WagerTransactionProcessed`, `WagerTransactionRejected` e
+`WagerTransactionPendingReference`. Uma operação que muda o saldo também gera
+`WalletBalanceChanged`. Eventos carregam envelope versionado; valores monetários
+seguem como decimal em string. Nenhuma chamada ao SQS ocorre no caso de uso.
+
+O `OutboxPublisher` reivindica lotes com `FOR UPDATE SKIP LOCKED`, atribui um
+lease de 60 segundos e confirma essa reivindicação antes de chamar o SQS. O envio
+acontece fora da transação SQL. A linha só recebe `published_at` depois do ACK
+positivo do SQS; erros liberam o lease e agendam retry exponencial de 1 segundo
+até 5 minutos, sem descartar a mensagem. O envio FIFO usa `aggregateId` como
+`MessageGroupId` e `eventId` como `MessageDeduplicationId`.
+
+Existe uma janela inevitável entre o SQS aceitar a mensagem e o banco confirmar
+`published_at`: se o processo cair nessa janela, o publisher tentará novamente
+após expirar o lease. A garantia é at-least-once; consumidores precisam deduplicar
+por `eventId`. A confirmação no banco é condicional ao token do lease, para um
+publisher antigo não atualizar uma linha que outro publisher já reivindicou.
+O publisher roda no processo da API quando `SQS_EVENTS_QUEUE_URL` está
+configurada. Sem essa configuração, os eventos ficam duráveis na outbox e um
+aviso é registrado.
+
+O `SqsWagerConsumer` faz long polling de uma mensagem por vez da fila de entrada
+e passa o payload validado ao mesmo `ProcessWager` usado pelo HTTP. Para mensagens
+financeiras, a inbox usa o `messageId` do envelope e SHA-256 do body, e é gravada
+como processada na mesma transação SQL da wager/saldo/ledger/outbox. O consumer
+apaga a mensagem SQS só depois do retorno do use case, que ocorre após o commit.
+Em redelivery, inbox já processada é reconhecida e a mensagem recebe ACK sem
+reaplicar efeitos.
+
+Rejeições de negócio que o use case devolve como estado terminal persistem inbox
+e são confirmadas. Erros de contrato são enviados à DLQ e a mensagem original é
+apagada somente após a cópia ser aceita. Falhas técnicas permanecem na fila e
+recebem atraso de visibilidade exponencial; a redrive policy local envia à DLQ
+após cinco entregas. A visibilidade é renovada enquanto o use case trabalha.
+Com `enableShutdownHooks()`, o consumer deixa de fazer novos polls no encerramento
+e aguarda o processamento atual, mantendo a mensagem invisível até poder concluir
+o commit e o ACK.
 
 ## Regras de transação e ledger
 

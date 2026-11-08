@@ -3,6 +3,10 @@ import { Injectable } from '@nestjs/common';
 import { LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
+import { InboxMessage } from '../../messaging/domain/inbox-message.js';
+import { InboxMessageEntity } from '../../messaging/infrastructure/inbox-message.entity.js';
+import { OutboxMessage } from '../../messaging/domain/outbox-message.js';
+import { OutboxMessageEntity } from '../../messaging/infrastructure/outbox-message.entity.js';
 import { WalletLedgerEntry } from '../../ledger/domain/wallet-ledger-entry.js';
 import { WalletLedgerEntryEntity } from '../../ledger/infrastructure/wallet-ledger-entry.entity.js';
 import { InsufficientWalletFundsError } from '../../wallets/domain/wallet.errors.js';
@@ -17,10 +21,19 @@ import {
 import { WagerTransaction as WagerTransactionAggregate } from '../domain/wager-transaction.js';
 import { WagerTransactionEntity } from '../infrastructure/wager-transaction.entity.js';
 import {
+  WalletBalanceChanged,
+  WagerTransactionPendingReference,
+  WagerTransactionProcessed,
+  WagerTransactionRejected,
+  type WagerEventContext,
+} from '../domain/wagering-events.js';
+import {
   ExternalTransactionConflictError,
   IdempotencyConflictError,
   InvalidWagerAmountError,
   MissingWagerResultSnapshotError,
+  InboxMessagePayloadConflictError,
+  InboxMessageWithoutWagerError,
   WalletNotFoundError,
   WalletOwnershipMismatchError,
   WagerCurrencyMismatchError,
@@ -39,6 +52,32 @@ type ReferenceResolution =
 @Injectable()
 export class ProcessWager {
   constructor(private readonly em: EntityManager) {}
+
+  async recordTerminalInboxMessage(props: {
+    messageId: string;
+    consumerName: string;
+    payloadHash: string;
+    receivedAt?: Date;
+  }): Promise<void> {
+    await this.em.transactional(async (em) => {
+      const existing = await em.findOne(InboxMessageEntity, {
+        consumerName: props.consumerName,
+        messageId: props.messageId,
+      });
+      if (existing) {
+        if (existing.payloadHash !== props.payloadHash) {
+          throw new InboxMessagePayloadConflictError();
+        }
+        if (!existing.processedAt) {
+          existing.processedAt = new Date();
+          await em.flush();
+        }
+        return;
+      }
+      await this.persistInboxMessage(em, props, new Date());
+      await em.flush();
+    });
+  }
 
   async execute(props: ProcessWagerProps): Promise<ProcessWagerResult> {
     const money = Money.from(props.money);
@@ -66,10 +105,17 @@ export class ProcessWager {
     money: Money,
     payloadHash: string,
   ): Promise<ProcessWagerResult> {
+    const inboxReplay = await this.replayInboxMessage(em, props, payloadHash);
+    if (inboxReplay) return inboxReplay;
+
     const existing = await em.findOne(WagerTransactionEntity, {
       idempotencyKey: props.idempotencyKey,
     });
-    if (existing) return this.replay(existing, payloadHash);
+    if (existing) {
+      await this.persistInboxMessage(em, props.inboxMessage, new Date());
+      if (props.inboxMessage) await em.flush();
+      return this.replay(existing, payloadHash);
+    }
 
     const walletEntity = await em.findOne(WalletEntity, props.walletId, {
       lockMode: LockMode.PESSIMISTIC_WRITE,
@@ -79,7 +125,17 @@ export class ProcessWager {
     const duplicateAfterLock = await em.findOne(WagerTransactionEntity, {
       idempotencyKey: props.idempotencyKey,
     });
-    if (duplicateAfterLock) return this.replay(duplicateAfterLock, payloadHash);
+    const inboxReplayAfterLock = await this.replayInboxMessage(
+      em,
+      props,
+      payloadHash,
+    );
+    if (inboxReplayAfterLock) return inboxReplayAfterLock;
+    if (duplicateAfterLock) {
+      await this.persistInboxMessage(em, props.inboxMessage, new Date());
+      if (props.inboxMessage) await em.flush();
+      return this.replay(duplicateAfterLock, payloadHash);
+    }
 
     const externalDuplicate = await em.findOne(WagerTransactionEntity, {
       providerId: props.providerId,
@@ -143,7 +199,6 @@ export class ProcessWager {
 
     if (wager.status === WagerTransactionStatus.Pending) {
       if (props.kind === WagerTransactionKind.Loss) {
-        
         wager.markProcessed(referenceEntity?.id, now);
       } else {
         const direction = wager.ledgerDirectionFor(referenceAggregate);
@@ -184,9 +239,66 @@ export class ProcessWager {
     em.persist(this.toTransactionEntity(wager, resultingBalance.amount));
     await em.flush();
 
-    // The ledger row references its wager row. Both flushes remain within this transaction.
     if (ledgerEntity) {
       em.persist(ledgerEntity);
+      await em.flush();
+    }
+
+    await this.persistInboxMessage(em, props.inboxMessage, now);
+
+    const eventContext: WagerEventContext = {
+      correlationId: props.correlationId,
+      causationId: props.causationId,
+      transactionId: wager.id,
+      providerId: props.providerId,
+      externalTransactionId: props.externalTransactionId,
+      playerId: props.playerId,
+      walletId: props.walletId,
+      roundId: props.roundId,
+      gameId: props.gameId,
+      kind: props.kind,
+      money: money.toJSON(),
+      referenceExternalTransactionId: props.referenceExternalTransactionId,
+      referenceTransactionId: wager.referenceTransactionId,
+      occurredAt: now,
+    };
+    const outboxMessages = [];
+    if (wager.status === WagerTransactionStatus.Processed) {
+      outboxMessages.push(WagerTransactionProcessed.from(eventContext));
+    } else if (wager.status === WagerTransactionStatus.Rejected) {
+      if (!wager.failureCode) {
+        throw new Error('Rejected wager is missing its failure code');
+      }
+      outboxMessages.push(
+        WagerTransactionRejected.from(eventContext, wager.failureCode),
+      );
+    } else if (wager.status === WagerTransactionStatus.PendingReference) {
+      outboxMessages.push(WagerTransactionPendingReference.from(eventContext));
+    }
+
+    if (ledgerEntity) {
+      outboxMessages.push(
+        WalletBalanceChanged.from(eventContext, {
+          direction: ledgerEntity.direction as LedgerDirection,
+          balanceBefore: {
+            amount: ledgerEntity.balanceBefore,
+            currency: ledgerEntity.currency,
+          },
+          balanceAfter: {
+            amount: ledgerEntity.balanceAfter,
+            currency: ledgerEntity.currency,
+          },
+          walletVersion: walletEntity.version,
+        }),
+      );
+    }
+
+    if (outboxMessages.length > 0) {
+      em.persist(
+        outboxMessages.map((event) =>
+          this.toOutboxEntity(OutboxMessage.enqueue(event, now)),
+        ),
+      );
       await em.flush();
     }
 
@@ -356,6 +468,21 @@ export class ProcessWager {
     originalError: UniqueConstraintViolationException,
   ): Promise<ProcessWagerResult> {
     const em = this.em.fork({ clear: true });
+    if (props.inboxMessage) {
+      const inbox = await em.findOne(InboxMessageEntity, {
+        consumerName: props.inboxMessage.consumerName,
+        messageId: props.inboxMessage.messageId,
+      });
+      if (inbox) {
+        if (inbox.payloadHash !== props.inboxMessage.payloadHash) {
+          throw new InboxMessagePayloadConflictError();
+        }
+        const inboxWager = await em.findOne(WagerTransactionEntity, {
+          idempotencyKey: props.idempotencyKey,
+        });
+        if (inboxWager) return this.replay(inboxWager, payloadHash);
+      }
+    }
     const byKey = await em.findOne(WagerTransactionEntity, {
       idempotencyKey: props.idempotencyKey,
     });
@@ -367,6 +494,55 @@ export class ProcessWager {
     });
     if (byExternalId) throw new ExternalTransactionConflictError();
     throw originalError;
+  }
+
+  private async replayInboxMessage(
+    em: EntityManager,
+    props: ProcessWagerProps,
+    payloadHash: string,
+  ): Promise<ProcessWagerResult | undefined> {
+    const inboxProps = props.inboxMessage;
+    if (!inboxProps) return undefined;
+    const inbox = await em.findOne(InboxMessageEntity, {
+      consumerName: inboxProps.consumerName,
+      messageId: inboxProps.messageId,
+    });
+    if (!inbox) return undefined;
+    if (inbox.payloadHash !== inboxProps.payloadHash) {
+      throw new InboxMessagePayloadConflictError();
+    }
+
+    const wager = await em.findOne(WagerTransactionEntity, {
+      idempotencyKey: props.idempotencyKey,
+    });
+    if (!wager) throw new InboxMessageWithoutWagerError();
+    if (!inbox.processedAt) {
+      inbox.processedAt = new Date();
+      await em.flush();
+    }
+    return this.replay(wager, payloadHash);
+  }
+
+  private async persistInboxMessage(
+    em: EntityManager,
+    inboxProps: ProcessWagerProps['inboxMessage'],
+    processedAt: Date,
+  ): Promise<void> {
+    if (!inboxProps) return;
+    const inbox = InboxMessage.receive({
+      ...inboxProps,
+      receivedAt: inboxProps.receivedAt ?? processedAt,
+    });
+    inbox.markProcessed(processedAt);
+    const entity = new InboxMessageEntity();
+    Object.assign(entity, {
+      messageId: inbox.messageId,
+      consumerName: inbox.consumerName,
+      payloadHash: inbox.payloadHash,
+      receivedAt: inbox.receivedAt,
+      processedAt: inbox.processedAt,
+    });
+    em.persist(entity);
   }
 
   private replay(
@@ -417,6 +593,25 @@ export class ProcessWager {
       failureCode: wager.failureCode,
       createdAt: wager.createdAt,
       processedAt: wager.processedAt,
+    });
+    return entity;
+  }
+
+  private toOutboxEntity(message: OutboxMessage): OutboxMessageEntity {
+    const entity = new OutboxMessageEntity();
+    Object.assign(entity, {
+      id: message.id,
+      aggregateId: message.aggregateId,
+      eventType: message.eventType,
+      payload: message.payload,
+      occurredAt: message.occurredAt,
+      createdAt: message.createdAt,
+      attempts: message.attempts,
+      nextAttemptAt: message.nextAttemptAt,
+      publishedAt: message.publishedAt ?? null,
+      leaseToken: message.leaseToken ?? null,
+      leaseUntil: message.leaseUntil ?? null,
+      lastError: message.lastError ?? null,
     });
     return entity;
   }
