@@ -105,6 +105,15 @@ para responder replays sem devolver o saldo atual, inclusive em uma aposta
 rejeitada por saldo insuficiente. Esta primeira versão do caso de uso processa
 BET; os demais tipos, outbox e publicação de eventos ainda serão adicionados.
 
+`POST /wagering/transactions` é a entrada HTTP síncrona desse caso de uso. A
+camada de apresentação valida o header `Idempotency-Key`, o contrato e os
+campos aceitos antes de chamar `ProcessBet`; por enquanto somente `kind: BET` é
+aceito. A API responde `200` com `status: PROCESSED` ou `status: REJECTED` para
+resultados financeiros já persistidos. Payload inválido retorna `400`, conflitos
+de idempotência/ID externo retornam `409`, wallet ausente retorna `404` e
+incompatibilidades de jogador/moeda retornam `422`. A autenticação permanece
+fora do escopo, conforme decisão da seção 2 do desafio.
+
 ## Regras de transação e ledger
 
 `WagerTransaction` nasce em `PENDING`. As transições permitidas são:

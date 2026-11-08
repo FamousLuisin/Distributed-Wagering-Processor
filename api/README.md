@@ -52,5 +52,35 @@ bun run test:integration
 O teste aplica migrations pendentes e dispara, ao mesmo tempo, duas apostas de
 R$ 80 em uma wallet com R$ 100. Ele verifica que uma fica `PROCESSED`, a outra
 `REJECTED` por saldo insuficiente, o saldo termina em R$ 20 e existe apenas um
-lançamento de débito. Como o ledger é append-only, os registros criados pelo
-teste permanecem no banco; use um banco local descartável para essa validação.
+lançamento de débito. A mesma suíte também envia requisições pela rota HTTP para
+confirmar replay idempotente e conflito quando a chave é reutilizada com outro
+payload. Como o ledger é append-only, os registros criados pelo teste permanecem
+no banco; use um banco local descartável para essa validação.
+
+## Endpoint de aposta
+
+Com a API iniciada e uma wallet existente, envie uma aposta `BET`:
+
+```http
+POST /wagering/transactions
+Idempotency-Key: provider-a:transaction-123
+Content-Type: application/json
+```
+
+```json
+{
+  "providerId": "provider-a",
+  "externalTransactionId": "transaction-123",
+  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+  "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+  "roundId": "round-987",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "25.00", "currency": "BRL" }
+}
+```
+
+O endpoint retorna `200` com o status financeiro (`PROCESSED` ou `REJECTED`), o
+saldo observado e `idempotentReplay`. Rejeição por saldo insuficiente é um
+resultado de negócio persistido, não um erro HTTP. A chave de idempotência é
+obrigatória no header; a API neste estágio aceita somente `BET`.
