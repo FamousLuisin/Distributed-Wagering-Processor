@@ -2,7 +2,6 @@ import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
 import type { CreateLedgerEntryProps, LedgerEntryState } from './wallet-ledger-entry.types.js';
 import { InvalidLedgerEntryError } from './wallet-ledger-entry.errors.js';
 
-/** Immutable audit record of one wallet balance movement. */
 export class WalletLedgerEntry {
   private constructor(
     public readonly id: string,

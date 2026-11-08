@@ -70,6 +70,40 @@ O fluxo financeiro será orquestrado por um caso de uso de `wagering`, usando
 uma transação MikroORM para persistir transação, wallet, ledger, inbox (quando
 aplicável) e outbox de forma atômica.
 
+## Persistência inicial
+
+Os `EntitySchema` ficam nas camadas de infraestrutura e mantêm o domínio sem
+dependência do ORM. `Money` é persistido como `numeric(20,2)` e moeda em coluna
+separada; o valor numérico é lido/escrito como string decimal. A versão da wallet
+é a versão otimista do MikroORM. As garantias de unicidade, saldo não negativo,
+aritmética do ledger e ledger append-only também estão na migration SQL, para
+continuarem valendo com mais de uma instância.
+
+A primeira migration cria `wallets`, `wager_transactions` e
+`wallet_ledger_entries`. Ela também impõe unicidade global da chave de
+idempotência, unicidade por provedor/ID externo, uma reversão por referência e
+tipo, no máximo um lançamento por transação/wallet, e um trigger que rejeita
+UPDATE/DELETE do ledger. O formato do código de moeda é validado como três letras
+maiúsculas; a lista ISO-4217 não é mantida dentro do domínio, conforme decisão
+de escopo.
+
+## Processamento de BET
+
+`ProcessBet` calcula SHA-256 do JSON canônico dos campos de negócio (chaves
+ordenadas recursivamente; `Idempotency-Key` excluído) e executa a operação em
+`EntityManager.transactional()`. Ele lê a chave de idempotência, adquire lock
+`PESSIMISTIC_WRITE` somente na linha da wallet e volta a consultar a chave depois
+do lock. Isso serializa disputas sobre a mesma wallet e permite paralelismo entre
+wallets distintas. Uma corrida de inserção da mesma chave em wallets diferentes
+é resolvida pela constraint única do PostgreSQL e pela leitura de recuperação
+após rollback.
+
+O saldo, a versão e o timestamp da wallet, a transação e o ledger são flushados
+na mesma transação SQL. A transação guarda `resulting_balance`, snapshot usado
+para responder replays sem devolver o saldo atual, inclusive em uma aposta
+rejeitada por saldo insuficiente. Esta primeira versão do caso de uso processa
+BET; os demais tipos, outbox e publicação de eventos ainda serão adicionados.
+
 ## Regras de transação e ledger
 
 `WagerTransaction` nasce em `PENDING`. As transições permitidas são:
