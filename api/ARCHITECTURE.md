@@ -80,7 +80,8 @@ aritmética do ledger e ledger append-only também estão na migration SQL, para
 continuarem valendo com mais de uma instância.
 
 A primeira migration cria `wallets`, `wager_transactions` e
-`wallet_ledger_entries`. Ela também impõe unicidade global da chave de
+`wallet_ledger_entries`. A migration seguinte adiciona o snapshot
+`resulting_balance` usado para responder replays. A primeira migration também impõe unicidade global da chave de
 idempotência, unicidade por provedor/ID externo, uma reversão por referência e
 tipo, no máximo um lançamento por transação/wallet, e um trigger que rejeita
 UPDATE/DELETE do ledger. O formato do código de moeda é validado como três letras

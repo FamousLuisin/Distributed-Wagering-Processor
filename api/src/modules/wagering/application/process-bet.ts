@@ -141,8 +141,12 @@ export class ProcessBet {
     const resultingBalance = wallet.balance.toJSON();
     const transactionEntity = this.toEntity(wager, resultingBalance.amount);
     em.persist(transactionEntity);
-    if (ledgerEntity) em.persist(ledgerEntity);
     await em.flush();
+
+    if (ledgerEntity) {
+      em.persist(ledgerEntity);
+      await em.flush();
+    }
 
     return {
       transactionId: wager.id,
