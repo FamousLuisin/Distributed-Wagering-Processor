@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
-import { ProcessBet } from './application/process-bet.js';
+import { ProcessWager } from './application/process-wager.js';
 import { WageringController } from './presentation/wagering.controller.js';
 
 @Module({
   controllers: [WageringController],
-  providers: [ProcessBet],
-  exports: [ProcessBet],
+  providers: [ProcessWager],
+  exports: [ProcessWager],
 })
 export class WageringModule {}

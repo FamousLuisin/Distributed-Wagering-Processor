@@ -1,7 +1,11 @@
 import type { MoneyProps } from '../../wallets/domain/money.props.js';
-import type { FailureCode, WagerTransactionStatus } from '../domain/wager-transaction.types.js';
+import type {
+  FailureCode,
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from '../domain/wager-transaction.types.js';
 
-export interface ProcessBetProps {
+export interface ProcessWagerProps {
   providerId: string;
   externalTransactionId: string;
   idempotencyKey: string;
@@ -9,10 +13,12 @@ export interface ProcessBetProps {
   walletId: string;
   roundId: string;
   gameId: string;
+  kind: Exclude<WagerTransactionKind, WagerTransactionKind.Opening>;
   money: MoneyProps;
+  referenceExternalTransactionId?: string;
 }
 
-export interface ProcessBetResult {
+export interface ProcessWagerResult {
   transactionId: string;
   status: WagerTransactionStatus;
   balance: MoneyProps;

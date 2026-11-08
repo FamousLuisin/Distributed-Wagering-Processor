@@ -1,14 +1,19 @@
 import { BadRequestException } from '@nestjs/common';
-import { InvalidCurrencyCodeError, InvalidMoneyAmountError } from '../../wallets/domain/money.errors.js';
+import {
+  InvalidCurrencyCodeError,
+  InvalidMoneyAmountError,
+} from '../../wallets/domain/money.errors.js';
 import { Money } from '../../wallets/domain/money.js';
-import type { ProcessBetProps } from '../application/process-bet.types.js';
+import type { ProcessWagerProps } from '../application/process-wager.types.js';
+import { WagerTransactionKind } from '../domain/wager-transaction.types.js';
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export function parseSubmitBetRequest(
+export function parseSubmitWagerRequest(
   body: unknown,
   idempotencyKey: string | undefined,
-): ProcessBetProps {
+): ProcessWagerProps {
   if (!isRecord(body)) {
     throw invalidRequest('Request body must be a JSON object');
   }
@@ -25,14 +30,32 @@ export function parseSubmitBetRequest(
   const roundId = requiredText(body.roundId, 'roundId', 255);
   const gameId = requiredText(body.gameId, 'gameId', 255);
 
-  if (!UUID_PATTERN.test(playerId)) {
+  if (!UUID_PATTERN.test(playerId))
     throw invalidRequest('playerId must be a UUID');
-  }
-  if (!UUID_PATTERN.test(walletId)) {
+  if (!UUID_PATTERN.test(walletId))
     throw invalidRequest('walletId must be a UUID');
+  if (!isExternalKind(body.kind)) {
+    throw invalidRequest('kind must be BET, WIN, LOSS, REFUND, or ROLLBACK');
   }
-  if (body.kind !== 'BET') {
-    throw invalidRequest('Only BET transactions are currently supported');
+  const kind = body.kind;
+  const referenceExternalTransactionId =
+    body.referenceExternalTransactionId === undefined
+      ? undefined
+      : requiredText(
+          body.referenceExternalTransactionId,
+          'referenceExternalTransactionId',
+          255,
+        );
+
+  if (
+    (kind === WagerTransactionKind.Refund ||
+      kind === WagerTransactionKind.Rollback) &&
+    !referenceExternalTransactionId
+  ) {
+    throw invalidRequest(`${kind} requires referenceExternalTransactionId`);
+  }
+  if (kind === WagerTransactionKind.Bet && referenceExternalTransactionId) {
+    throw invalidRequest('BET cannot contain referenceExternalTransactionId');
   }
   if (!isRecord(body.money)) {
     throw invalidRequest('money must contain amount and currency');
@@ -54,7 +77,7 @@ export function parseSubmitBetRequest(
   }
 
   if (!money.isPositive()) {
-    throw invalidRequest('BET amount must be greater than zero');
+    throw invalidRequest('Transaction amount must be greater than zero');
   }
   const integerDigits = amount.split('.')[0]!.replace(/^0+/, '').length;
   if (integerDigits > 18) {
@@ -69,17 +92,37 @@ export function parseSubmitBetRequest(
     walletId,
     roundId,
     gameId,
+    kind,
     money: money.toJSON(),
+    ...(referenceExternalTransactionId
+      ? { referenceExternalTransactionId }
+      : {}),
   };
 }
 
-function requiredText(value: unknown, field: string, maxLength: number): string {
+function isExternalKind(value: unknown): value is ProcessWagerProps['kind'] {
+  return (
+    value === WagerTransactionKind.Bet ||
+    value === WagerTransactionKind.Win ||
+    value === WagerTransactionKind.Loss ||
+    value === WagerTransactionKind.Refund ||
+    value === WagerTransactionKind.Rollback
+  );
+}
+
+function requiredText(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw invalidRequest(`${field} is required`);
   }
   const normalized = value.trim();
   if (normalized.length > maxLength) {
-    throw invalidRequest(`${field} must contain at most ${maxLength} characters`);
+    throw invalidRequest(
+      `${field} must contain at most ${maxLength} characters`,
+    );
   }
   return normalized;
 }

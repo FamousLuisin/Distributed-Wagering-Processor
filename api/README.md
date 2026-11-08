@@ -80,7 +80,10 @@ Content-Type: application/json
 }
 ```
 
-O endpoint retorna `200` com o status financeiro (`PROCESSED` ou `REJECTED`), o
-saldo observado e `idempotentReplay`. Rejeição por saldo insuficiente é um
-resultado de negócio persistido, não um erro HTTP. A chave de idempotência é
-obrigatória no header; a API neste estágio aceita somente `BET`.
+O endpoint aceita `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` (`OPENING` é
+interno). `WIN` e `LOSS` podem receber `referenceExternalTransactionId`; `REFUND`
+e `ROLLBACK` precisam dele. Resultados processados ou rejeitados retornam `200`;
+uma operação aguardando a referência retorna `202` com `PENDING_REFERENCE`.
+Rejeições de negócio, como saldo insuficiente ou reversão duplicada, aparecem no
+corpo como `status: REJECTED` e trazem um `failureCode`. A chave de idempotência
+é obrigatória no header.

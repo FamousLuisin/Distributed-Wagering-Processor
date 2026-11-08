@@ -7,9 +7,10 @@ import { AppModule } from '../../../app.module.js';
 import config from '../../../database/mikro-orm.config.js';
 import { WalletLedgerEntryEntity } from '../../ledger/infrastructure/wallet-ledger-entry.entity.js';
 import { WalletEntity } from '../../wallets/infrastructure/wallet.entity.js';
-import { ProcessBet } from './process-bet.js';
-import type { ProcessBetResult } from './process-bet.types.js';
+import { ProcessWager } from './process-wager.js';
+import type { ProcessWagerResult } from './process-wager.types.js';
 import { WagerTransactionEntity } from '../infrastructure/wager-transaction.entity.js';
+import { WagerTransactionKind } from '../domain/wager-transaction.types.js';
 
 describe('Wagering transactions (PostgreSQL and HTTP)', () => {
   let orm: MikroORM;
@@ -49,23 +50,24 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     await setupEm.flush();
     setupEm.clear();
 
-    const processBet = new ProcessBet(orm.em);
+    const processWager = new ProcessWager(orm.em);
     const common = {
       providerId: 'integration-test',
       playerId,
       walletId,
       roundId: randomUUID(),
       gameId: 'concurrency-case',
+      kind: WagerTransactionKind.Bet as const,
       money: { amount: '80.00', currency: 'BRL' },
     };
 
     const results = await Promise.all([
-      processBet.execute({
+      processWager.execute({
         ...common,
         externalTransactionId: randomUUID(),
         idempotencyKey: randomUUID(),
       }),
-      processBet.execute({
+      processWager.execute({
         ...common,
         externalTransactionId: randomUUID(),
         idempotencyKey: randomUUID(),
@@ -122,7 +124,7 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     });
 
     const firstResponse = await postBet(baseUrl, originalBet);
-    const firstResult = (await firstResponse.json()) as ProcessBetResult;
+    const firstResult = (await firstResponse.json()) as ProcessWagerResult;
     const laterResponse = await postBet(
       baseUrl,
       makeBet({
@@ -133,9 +135,9 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
         amount: '10.00',
       }),
     );
-    const laterResult = (await laterResponse.json()) as ProcessBetResult;
+    const laterResult = (await laterResponse.json()) as ProcessWagerResult;
     const replayResponse = await postBet(baseUrl, originalBet);
-    const replayResult = (await replayResponse.json()) as ProcessBetResult;
+    const replayResult = (await replayResponse.json()) as ProcessWagerResult;
 
     expect(firstResponse.status).toBe(200);
     expect(laterResponse.status).toBe(200);
@@ -224,6 +226,7 @@ function makeBet(props: {
     walletId: props.walletId,
     roundId: randomUUID(),
     gameId: 'idempotency-case',
+    kind: WagerTransactionKind.Bet,
     money: { amount: props.amount, currency: 'BRL' },
   };
 }
@@ -239,6 +242,6 @@ async function postBet(
       'content-type': 'application/json',
       'idempotency-key': idempotencyKey,
     },
-    body: JSON.stringify({ ...body, kind: 'BET' }),
+    body: JSON.stringify(body),
   });
 }

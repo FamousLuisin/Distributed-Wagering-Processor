@@ -148,7 +148,9 @@ export class WagerTransaction {
   }
 
   get processedAt(): Date | undefined {
-    return this._processedAt ? new Date(this._processedAt.getTime()) : undefined;
+    return this._processedAt
+      ? new Date(this._processedAt.getTime())
+      : undefined;
   }
 
   markProcessed(referenceTransactionId: string | undefined, at: Date): void {
@@ -160,7 +162,10 @@ export class WagerTransaction {
         `${this.kind} must be processed with a resolved reference transaction id`,
       );
     }
-    if (referenceTransactionId !== undefined && !referenceTransactionId.trim()) {
+    if (
+      referenceTransactionId !== undefined &&
+      !referenceTransactionId.trim()
+    ) {
       throw new InvalidWagerTransactionReferenceError(
         'Reference transaction id must not be empty',
       );
@@ -176,7 +181,13 @@ export class WagerTransaction {
     this.assertCanTransition();
     if (
       this._status !== WagerTransactionStatus.Pending ||
-      !this.requiresReference()
+      !this.referenceExternalTransactionId ||
+      ![
+        WagerTransactionKind.Win,
+        WagerTransactionKind.Loss,
+        WagerTransactionKind.Refund,
+        WagerTransactionKind.Rollback,
+      ].includes(this.kind)
     ) {
       throw new InvalidWagerTransactionTransitionError(
         this._status,
@@ -228,11 +239,14 @@ export class WagerTransaction {
   ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {
     switch (this.kind) {
       case WagerTransactionKind.Opening:
+        return LedgerDirection.Credit;
       case WagerTransactionKind.Win:
-      case WagerTransactionKind.Refund:
-        if (this.kind === WagerTransactionKind.Refund) {
+        if (reference) {
           this.assertProcessedReference(reference, [WagerTransactionKind.Bet]);
         }
+        return LedgerDirection.Credit;
+      case WagerTransactionKind.Refund:
+        this.assertProcessedReference(reference, [WagerTransactionKind.Bet]);
         return LedgerDirection.Credit;
       case WagerTransactionKind.Bet:
         return LedgerDirection.Debit;
@@ -289,7 +303,10 @@ export class WagerTransaction {
   }
 
   private static validateCommon(
-    props: CreateWagerTransactionProps | CreateOpeningWagerTransactionProps | WagerTransactionState,
+    props:
+      | CreateWagerTransactionProps
+      | CreateOpeningWagerTransactionProps
+      | WagerTransactionState,
   ): void {
     const fields = [
       ['id', props.id],
@@ -308,7 +325,9 @@ export class WagerTransaction {
       }
     }
     if (props.money.isNegative()) {
-      throw new InvalidWagerTransactionError('Transaction money cannot be negative');
+      throw new InvalidWagerTransactionError(
+        'Transaction money cannot be negative',
+      );
     }
   }
 
@@ -316,20 +335,35 @@ export class WagerTransaction {
     kind: WagerTransactionKind,
     referenceExternalTransactionId: string | undefined,
   ): void {
-    const required = kind === WagerTransactionKind.Refund || kind === WagerTransactionKind.Rollback;
-    
+    const required =
+      kind === WagerTransactionKind.Refund ||
+      kind === WagerTransactionKind.Rollback;
+
     if (required && !referenceExternalTransactionId?.trim()) {
       throw new InvalidWagerTransactionReferenceError(
         `${kind} requires referenceExternalTransactionId`,
       );
     }
-    
+
     if (
       referenceExternalTransactionId !== undefined &&
       !referenceExternalTransactionId.trim()
     ) {
       throw new InvalidWagerTransactionReferenceError(
         'referenceExternalTransactionId must not be empty',
+      );
+    }
+    if (
+      referenceExternalTransactionId !== undefined &&
+      ![
+        WagerTransactionKind.Win,
+        WagerTransactionKind.Loss,
+        WagerTransactionKind.Refund,
+        WagerTransactionKind.Rollback,
+      ].includes(kind)
+    ) {
+      throw new InvalidWagerTransactionReferenceError(
+        `${kind} cannot contain referenceExternalTransactionId`,
       );
     }
   }

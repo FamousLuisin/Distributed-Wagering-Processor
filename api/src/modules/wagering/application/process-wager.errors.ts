@@ -7,7 +7,9 @@ export class IdempotencyConflictError extends Error {
 
 export class ExternalTransactionConflictError extends Error {
   constructor() {
-    super('Provider transaction id was already used with another idempotency key');
+    super(
+      'Provider transaction id was already used with another idempotency key',
+    );
     this.name = 'ExternalTransactionConflictError';
   }
 }
@@ -37,5 +39,12 @@ export class MissingWagerResultSnapshotError extends Error {
   constructor() {
     super('The stored wager does not contain its original balance result');
     this.name = 'MissingWagerResultSnapshotError';
+  }
+}
+
+export class InvalidWagerAmountError extends Error {
+  constructor() {
+    super('Wager amount must be greater than zero');
+    this.name = 'InvalidWagerAmountError';
   }
 }

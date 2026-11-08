@@ -88,9 +88,9 @@ UPDATE/DELETE do ledger. O formato do código de moeda é validado como três le
 maiúsculas; a lista ISO-4217 não é mantida dentro do domínio, conforme decisão
 de escopo.
 
-## Processamento de BET
+## Processamento de transações de aposta
 
-`ProcessBet` calcula SHA-256 do JSON canônico dos campos de negócio (chaves
+`ProcessWager` calcula SHA-256 do JSON canônico dos campos de negócio (chaves
 ordenadas recursivamente; `Idempotency-Key` excluído) e executa a operação em
 `EntityManager.transactional()`. Ele lê a chave de idempotência, adquire lock
 `PESSIMISTIC_WRITE` somente na linha da wallet e volta a consultar a chave depois
@@ -101,18 +101,27 @@ após rollback.
 
 O saldo, a versão e o timestamp da wallet, a transação e o ledger são flushados
 na mesma transação SQL. A transação guarda `resulting_balance`, snapshot usado
-para responder replays sem devolver o saldo atual, inclusive em uma aposta
-rejeitada por saldo insuficiente. Esta primeira versão do caso de uso processa
-BET; os demais tipos, outbox e publicação de eventos ainda serão adicionados.
+para responder replays sem devolver o saldo atual, inclusive em operações
+rejeitadas. `BET` debita, `WIN` credita e `LOSS` registra o resultado sem mover
+saldo nem gravar ledger. `REFUND` credita uma `BET` processada. `ROLLBACK`
+inverte o sentido da `BET`, `WIN` ou `REFUND` processada que referencia.
 
-`POST /wagering/transactions` é a entrada HTTP síncrona desse caso de uso. A
-camada de apresentação valida o header `Idempotency-Key`, o contrato e os
-campos aceitos antes de chamar `ProcessBet`; por enquanto somente `kind: BET` é
-aceito. A API responde `200` com `status: PROCESSED` ou `status: REJECTED` para
-resultados financeiros já persistidos. Payload inválido retorna `400`, conflitos
-de idempotência/ID externo retornam `409`, wallet ausente retorna `404` e
-incompatibilidades de jogador/moeda retornam `422`. A autenticação permanece
-fora do escopo, conforme decisão da seção 2 do desafio.
+Referências são resolvidas por provedor/ID externo e precisam pertencer ao mesmo
+jogador, wallet, moeda e rodada; também devem estar processadas e ter um tipo
+permitido. `REFUND` e `ROLLBACK` precisam usar o mesmo valor da referência e só
+podem ocorrer uma vez por referência e tipo. Uma referência informada que ainda
+não existe fica `PENDING_REFERENCE` e retorna HTTP `202`; referências inválidas,
+saldo insuficiente ou reversão duplicada são registradas como `REJECTED` com
+`failureCode`. O worker que reprocessará as pendências ainda será implementado
+no módulo de mensageria.
+
+`POST /wagering/transactions` aceita `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK`;
+`OPENING` é interno. `WIN` e `LOSS` podem informar referência de `BET`; `REFUND`
+e `ROLLBACK` exigem `referenceExternalTransactionId`. Resultados finalizados
+retornam `200`, operações aguardando referência retornam `202`. Payload inválido
+retorna `400`, conflitos de idempotência/ID externo retornam `409`, wallet
+ausente retorna `404` e incompatibilidades de jogador/moeda retornam `422`. A
+autenticação permanece fora do escopo, conforme decisão da seção 2 do desafio.
 
 ## Regras de transação e ledger
 
