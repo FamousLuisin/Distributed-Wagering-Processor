@@ -42,6 +42,10 @@ import type {
   ProcessWagerProps,
   ProcessWagerResult,
 } from './process-wager.types.js';
+import {
+  pendingReferenceRetryDelay,
+  PENDING_REFERENCE_POLICY,
+} from './pending-reference-policy.js';
 
 type ReferenceResolution =
   | { type: 'none' }
@@ -49,9 +53,234 @@ type ReferenceResolution =
   | { type: 'invalid'; failureCode: FailureCode }
   | { type: 'valid'; entity: WagerTransactionEntity };
 
+export type PendingReferenceRetryResult =
+  | 'stale'
+  | 'rescheduled'
+  | 'processed'
+  | 'rejected';
+
 @Injectable()
 export class ProcessWager {
   constructor(private readonly em: EntityManager) {}
+
+  async retryPendingReference(
+    transactionId: string,
+    leaseToken: string,
+  ): Promise<PendingReferenceRetryResult> {
+    const em = this.em.fork({ clear: true });
+    return em.transactional(async (em) => {
+      const candidate = await em.findOne(WagerTransactionEntity, {
+        id: transactionId,
+        status: WagerTransactionStatus.PendingReference,
+      }, { refresh: true });
+      if (!candidate || candidate.pendingReferenceLeaseToken !== leaseToken) {
+        return 'stale';
+      }
+
+      // Keep the same lock order as new wager processing: wallet, then wager.
+      const walletEntity = await em.findOne(
+        WalletEntity,
+        candidate.walletId,
+        { lockMode: LockMode.PESSIMISTIC_WRITE },
+      );
+      if (!walletEntity) throw new WalletNotFoundError(candidate.walletId);
+
+      const wagerEntity = await em.findOne(
+        WagerTransactionEntity,
+        { id: transactionId },
+        { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
+      );
+      if (
+        !wagerEntity ||
+        wagerEntity.status !== WagerTransactionStatus.PendingReference ||
+        wagerEntity.pendingReferenceLeaseToken !== leaseToken
+      ) {
+        return 'stale';
+      }
+
+      const now = new Date();
+      const attempt = wagerEntity.pendingReferenceAttempts + 1;
+      const money = Money.from({
+        amount: wagerEntity.amount,
+        currency: wagerEntity.currency,
+      });
+      const props: ProcessWagerProps = {
+        providerId: wagerEntity.providerId,
+        externalTransactionId: wagerEntity.externalTransactionId,
+        idempotencyKey: wagerEntity.idempotencyKey,
+        playerId: wagerEntity.playerId,
+        walletId: wagerEntity.walletId,
+        roundId: wagerEntity.roundId,
+        gameId: wagerEntity.gameId,
+        kind: wagerEntity.kind as ProcessWagerProps['kind'],
+        money: money.toJSON(),
+        referenceExternalTransactionId:
+          wagerEntity.referenceExternalTransactionId,
+      };
+      const wager = this.toAggregate(wagerEntity);
+      const reference = await this.resolveReference(em, props, money);
+
+      if (reference.type === 'missing') {
+        const expiresAt = wagerEntity.pendingReferenceExpiresAt;
+        if (
+          attempt >= PENDING_REFERENCE_POLICY.maxAttempts ||
+          !expiresAt ||
+          now >= expiresAt
+        ) {
+          wager.reject(FailureCode.ReferenceNotFound);
+        } else {
+          const nextAttemptAt = new Date(
+            Math.min(
+              now.getTime() + pendingReferenceRetryDelay(attempt),
+              expiresAt.getTime(),
+            ),
+          );
+          wagerEntity.pendingReferenceAttempts = attempt;
+          wagerEntity.pendingReferenceNextAttemptAt = nextAttemptAt;
+          wagerEntity.pendingReferenceLeaseToken = null;
+          wagerEntity.pendingReferenceLeaseUntil = null;
+          await em.flush();
+          return 'rescheduled';
+        }
+      } else if (reference.type === 'invalid') {
+        wager.reject(reference.failureCode);
+      } else if (reference.type === 'valid' && this.isReversal(props.kind)) {
+        const previousReversal = await em.findOne(WagerTransactionEntity, {
+          referenceTransactionId: reference.entity.id,
+          kind: props.kind,
+        });
+        if (previousReversal) wager.reject(FailureCode.DuplicateReversal);
+      }
+
+      const referenceEntity =
+        reference.type === 'valid' ? reference.entity : undefined;
+      const referenceAggregate = referenceEntity
+        ? this.toAggregate(referenceEntity)
+        : undefined;
+      const wallet = Wallet.rehydrate({
+        id: walletEntity.id,
+        playerId: walletEntity.playerId,
+        currency: walletEntity.currency,
+        balance: Money.from({
+          amount: walletEntity.balance,
+          currency: walletEntity.currency,
+        }),
+        version: walletEntity.version,
+        createdAt: walletEntity.createdAt,
+        updatedAt: walletEntity.updatedAt,
+      });
+      let ledgerEntity: WalletLedgerEntryEntity | undefined;
+
+      if (wager.status === WagerTransactionStatus.PendingReference) {
+        if (props.kind === WagerTransactionKind.Loss) {
+          wager.markProcessed(referenceEntity?.id, now);
+        } else {
+          const direction = wager.ledgerDirectionFor(referenceAggregate);
+          try {
+            const change =
+              direction === LedgerDirection.Debit
+                ? wallet.debit(money, now)
+                : wallet.credit(money, now);
+            wager.markProcessed(referenceEntity?.id, now);
+            walletEntity.balance = change.balanceAfter.toJSON().amount;
+            walletEntity.version = change.version;
+            walletEntity.updatedAt = wallet.updatedAt;
+
+            ledgerEntity = this.toLedgerEntity(
+              WalletLedgerEntry.create({
+                id: randomUUID(),
+                walletId: wallet.id,
+                transactionId: wager.id,
+                direction,
+                money,
+                balanceBefore: change.balanceBefore,
+                balanceAfter: change.balanceAfter,
+                createdAt: now,
+              }),
+            );
+          } catch (error) {
+            if (!(error instanceof InsufficientWalletFundsError)) throw error;
+            wager.reject(
+              props.kind === WagerTransactionKind.Bet
+                ? FailureCode.InsufficientFunds
+                : FailureCode.ReversalInsufficientFunds,
+            );
+          }
+        }
+      }
+
+      wagerEntity.referenceTransactionId = wager.referenceTransactionId;
+      wagerEntity.status = wager.status;
+      wagerEntity.failureCode = wager.failureCode;
+      wagerEntity.processedAt = wager.processedAt;
+      wagerEntity.resultingBalance = wallet.balance.toJSON().amount;
+      wagerEntity.pendingReferenceAttempts = attempt;
+      wagerEntity.pendingReferenceNextAttemptAt = null;
+      wagerEntity.pendingReferenceExpiresAt = null;
+      wagerEntity.pendingReferenceLeaseToken = null;
+      wagerEntity.pendingReferenceLeaseUntil = null;
+      await em.flush();
+
+      if (ledgerEntity) {
+        em.persist(ledgerEntity);
+        await em.flush();
+      }
+
+      const eventContext: WagerEventContext = {
+        transactionId: wager.id,
+        providerId: wagerEntity.providerId,
+        externalTransactionId: wagerEntity.externalTransactionId,
+        playerId: wagerEntity.playerId,
+        walletId: wagerEntity.walletId,
+        roundId: wagerEntity.roundId,
+        gameId: wagerEntity.gameId,
+        kind: props.kind,
+        money: money.toJSON(),
+        referenceExternalTransactionId:
+          wagerEntity.referenceExternalTransactionId,
+        referenceTransactionId: wager.referenceTransactionId,
+        occurredAt: now,
+      };
+      const events = [];
+      if (wager.status === WagerTransactionStatus.Processed) {
+        events.push(WagerTransactionProcessed.from(eventContext));
+      } else if (wager.status === WagerTransactionStatus.Rejected) {
+        if (!wager.failureCode) {
+          throw new Error('Rejected wager is missing its failure code');
+        }
+        events.push(WagerTransactionRejected.from(eventContext, wager.failureCode));
+      }
+
+      if (ledgerEntity) {
+        events.push(
+          WalletBalanceChanged.from(eventContext, {
+            direction: ledgerEntity.direction as LedgerDirection,
+            balanceBefore: {
+              amount: ledgerEntity.balanceBefore,
+              currency: ledgerEntity.currency,
+            },
+            balanceAfter: {
+              amount: ledgerEntity.balanceAfter,
+              currency: ledgerEntity.currency,
+            },
+            walletVersion: walletEntity.version,
+          }),
+        );
+      }
+      if (events.length > 0) {
+        em.persist(
+          events.map((event) =>
+            this.toOutboxEntity(OutboxMessage.enqueue(event, now)),
+          ),
+        );
+        await em.flush();
+      }
+
+      return wager.status === WagerTransactionStatus.Processed
+        ? 'processed'
+        : 'rejected';
+    });
+  }
 
   async recordTerminalInboxMessage(props: {
     messageId: string;
@@ -437,11 +666,13 @@ export class ProcessWager {
       gameId: entity.gameId,
       kind: entity.kind as WagerTransactionKind,
       money: Money.from({ amount: entity.amount, currency: entity.currency }),
-      referenceExternalTransactionId: entity.referenceExternalTransactionId,
+      referenceExternalTransactionId:
+        entity.referenceExternalTransactionId ?? undefined,
       createdAt: entity.createdAt,
       status: entity.status as WagerTransactionStatus,
-      referenceTransactionId: entity.referenceTransactionId,
-      failureCode: entity.failureCode as FailureCode | undefined,
+      referenceTransactionId: entity.referenceTransactionId ?? undefined,
+      failureCode: (entity.failureCode as FailureCode | null | undefined) ??
+        undefined,
       processedAt: entity.processedAt,
     });
   }
@@ -573,6 +804,8 @@ export class ProcessWager {
     resultingBalance: string,
   ): WagerTransactionEntity {
     const entity = new WagerTransactionEntity();
+    const pendingReference =
+      wager.status === WagerTransactionStatus.PendingReference;
     Object.assign(entity, {
       id: wager.id,
       providerId: wager.providerId,
@@ -593,6 +826,15 @@ export class ProcessWager {
       failureCode: wager.failureCode,
       createdAt: wager.createdAt,
       processedAt: wager.processedAt,
+      pendingReferenceAttempts: 0,
+      pendingReferenceNextAttemptAt: pendingReference
+        ? new Date(wager.createdAt.getTime() + PENDING_REFERENCE_POLICY.baseDelayMs)
+        : null,
+      pendingReferenceExpiresAt: pendingReference
+        ? new Date(wager.createdAt.getTime() + PENDING_REFERENCE_POLICY.ttlMs)
+        : null,
+      pendingReferenceLeaseToken: null,
+      pendingReferenceLeaseUntil: null,
     });
     return entity;
   }

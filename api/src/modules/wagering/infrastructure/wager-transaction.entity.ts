@@ -20,6 +20,11 @@ export class WagerTransactionEntity {
   failureCode?: string;
   createdAt!: Date;
   processedAt?: Date;
+  pendingReferenceAttempts!: number;
+  pendingReferenceNextAttemptAt!: Date | null;
+  pendingReferenceExpiresAt!: Date | null;
+  pendingReferenceLeaseToken!: string | null;
+  pendingReferenceLeaseUntil!: Date | null;
 }
 
 export const WagerTransactionEntitySchema = new EntitySchema<WagerTransactionEntity>({
@@ -45,6 +50,11 @@ export const WagerTransactionEntitySchema = new EntitySchema<WagerTransactionEnt
     failureCode: { type: 'string', length: 64, nullable: true, fieldName: 'failure_code' },
     createdAt: { type: 'datetime', columnType: 'timestamptz', fieldName: 'created_at' },
     processedAt: { type: 'datetime', columnType: 'timestamptz', nullable: true, fieldName: 'processed_at' },
+    pendingReferenceAttempts: { type: 'integer', default: 0, fieldName: 'pending_reference_attempts' },
+    pendingReferenceNextAttemptAt: { type: 'datetime', columnType: 'timestamptz', nullable: true, fieldName: 'pending_reference_next_attempt_at' },
+    pendingReferenceExpiresAt: { type: 'datetime', columnType: 'timestamptz', nullable: true, fieldName: 'pending_reference_expires_at' },
+    pendingReferenceLeaseToken: { type: 'uuid', nullable: true, fieldName: 'pending_reference_lease_token' },
+    pendingReferenceLeaseUntil: { type: 'datetime', columnType: 'timestamptz', nullable: true, fieldName: 'pending_reference_lease_until' },
   },
   uniques: [
     { name: 'wager_transactions_idempotency_key_unique', properties: ['idempotencyKey'] },
@@ -59,5 +69,6 @@ export const WagerTransactionEntitySchema = new EntitySchema<WagerTransactionEnt
   indexes: [
     { name: 'wager_transactions_wallet_created_idx', properties: ['walletId', 'createdAt'] },
     { name: 'wager_transactions_pending_reference_idx', properties: ['createdAt'], where: '"status" = \'PENDING_REFERENCE\'' },
+    { name: 'wager_transactions_pending_reference_due_idx', properties: ['pendingReferenceNextAttemptAt', 'pendingReferenceExpiresAt'], where: '"status" = \'PENDING_REFERENCE\'' },
   ],
 });

@@ -7,6 +7,7 @@ import {
 } from './infrastructure/sqs-client.provider.js';
 import { SqsWagerConsumer } from './application/sqs-wager-consumer.js';
 import { WageringModule } from '../wagering/wagering.module.js';
+import { PendingReferenceWorker } from '../wagering/application/pending-reference-worker.js';
 
 @Module({
   imports: [WageringModule],
@@ -15,6 +16,7 @@ import { WageringModule } from '../wagering/wagering.module.js';
     { provide: SQS_CONSUMER_CLIENT, useFactory: createSqsClient },
     OutboxPublisher,
     SqsWagerConsumer,
+    PendingReferenceWorker,
   ],
   exports: [OutboxPublisher],
 })

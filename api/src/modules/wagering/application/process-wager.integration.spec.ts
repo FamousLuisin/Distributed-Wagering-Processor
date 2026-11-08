@@ -11,6 +11,8 @@ import { ProcessWager } from './process-wager.js';
 import type { ProcessWagerResult } from './process-wager.types.js';
 import { WagerTransactionEntity } from '../infrastructure/wager-transaction.entity.js';
 import { WagerTransactionKind } from '../domain/wager-transaction.types.js';
+import { OutboxMessageEntity } from '../../messaging/infrastructure/outbox-message.entity.js';
+import { PendingReferenceWorker } from './pending-reference-worker.js';
 
 describe('Wagering transactions (PostgreSQL and HTTP)', () => {
   let orm: MikroORM;
@@ -187,6 +189,211 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     expect(await readEm.count(WagerTransactionEntity, { walletId })).toBe(1);
     expect(await readEm.count(WalletLedgerEntryEntity, { walletId })).toBe(1);
   });
+
+  it('retries a missing reference after it arrives and commits financial state and outbox events together', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const processWager = new ProcessWager(orm.em);
+    const providerId = `pending-reference-${randomUUID()}`;
+    const referenceExternalTransactionId = randomUUID();
+    const pending = await processWager.execute({
+      providerId,
+      externalTransactionId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      playerId,
+      walletId,
+      roundId: randomUUID(),
+      gameId: 'pending-reference-recovery',
+      kind: WagerTransactionKind.Win,
+      money: { amount: '15.00', currency: 'BRL' },
+      referenceExternalTransactionId,
+    });
+
+    expect(pending.status).toBe('PENDING_REFERENCE');
+    const em = orm.em.fork({ clear: true });
+    const pendingRow = await em.findOneOrFail(WagerTransactionEntity, {
+      id: pending.transactionId,
+    });
+    expect(pendingRow.pendingReferenceNextAttemptAt).toBeInstanceOf(Date);
+    expect(pendingRow.pendingReferenceExpiresAt).toBeInstanceOf(Date);
+
+    await processWager.execute({
+      providerId,
+      externalTransactionId: referenceExternalTransactionId,
+      idempotencyKey: randomUUID(),
+      playerId,
+      walletId,
+      roundId: pendingRow.roundId,
+      gameId: 'pending-reference-recovery',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+
+    pendingRow.pendingReferenceNextAttemptAt = new Date(Date.now() - 1_000);
+    pendingRow.pendingReferenceLeaseToken = randomUUID();
+    pendingRow.pendingReferenceLeaseUntil = new Date(Date.now() - 1_000);
+    await em.flush();
+
+    await waitUntil(async () => {
+      const readEm = orm.em.fork({ clear: true });
+      const wager = await readEm.findOneOrFail(WagerTransactionEntity, {
+        id: pending.transactionId,
+      });
+      return wager.status === 'PROCESSED';
+    });
+
+    const verifyEm = orm.em.fork({ clear: true });
+    const wager = await verifyEm.findOneOrFail(WagerTransactionEntity, {
+      id: pending.transactionId,
+    });
+    const wallet = await verifyEm.findOneOrFail(WalletEntity, walletId);
+    expect(wager.pendingReferenceAttempts).toBeGreaterThan(0);
+    expect(wager.pendingReferenceLeaseToken).toBeNull();
+    expect(wager.pendingReferenceLeaseUntil).toBeNull();
+    expect(wallet.balance).toBe('105.00');
+    expect(
+      await verifyEm.count(WalletLedgerEntryEntity, {
+        transactionId: pending.transactionId,
+        direction: 'CREDIT',
+      }),
+    ).toBe(1);
+    expect(
+      await verifyEm.count(OutboxMessageEntity, {
+        aggregateId: pending.transactionId,
+        eventType: 'WagerTransactionProcessed',
+      }),
+    ).toBe(1);
+    expect(
+      await verifyEm.count(OutboxMessageEntity, {
+        aggregateId: walletId,
+        eventType: 'WalletBalanceChanged',
+      }),
+    ).toBe(2);
+  }, 20_000);
+
+  it('rejects a reference that remains missing after attempts expire', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const processWager = new ProcessWager(orm.em);
+    const pending = await processWager.execute({
+      providerId: `pending-reference-expiry-${randomUUID()}`,
+      externalTransactionId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      playerId,
+      walletId,
+      roundId: randomUUID(),
+      gameId: 'pending-reference-expiry',
+      kind: WagerTransactionKind.Win,
+      money: { amount: '15.00', currency: 'BRL' },
+      referenceExternalTransactionId: randomUUID(),
+    });
+    expect(pending.status).toBe('PENDING_REFERENCE');
+
+    const em = orm.em.fork({ clear: true });
+    const row = await em.findOneOrFail(WagerTransactionEntity, {
+      id: pending.transactionId,
+    });
+    row.pendingReferenceAttempts = 7;
+    row.pendingReferenceNextAttemptAt = new Date(Date.now() - 2_000);
+    row.pendingReferenceExpiresAt = new Date(Date.now() - 1_000);
+    row.pendingReferenceLeaseToken = randomUUID();
+    row.pendingReferenceLeaseUntil = new Date(Date.now() - 1_000);
+    await em.flush();
+
+    await waitUntil(async () => {
+      const readEm = orm.em.fork({ clear: true });
+      const wager = await readEm.findOneOrFail(WagerTransactionEntity, {
+        id: pending.transactionId,
+      });
+      return wager.status === 'REJECTED';
+    });
+
+    const verifyEm = orm.em.fork({ clear: true });
+    const wager = await verifyEm.findOneOrFail(WagerTransactionEntity, {
+      id: pending.transactionId,
+    });
+    const wallet = await verifyEm.findOneOrFail(WalletEntity, walletId);
+    expect(wager.failureCode).toBe('REFERENCE_NOT_FOUND');
+    expect(wallet.balance).toBe('100.00');
+    expect(
+      await verifyEm.count(WalletLedgerEntryEntity, {
+        transactionId: pending.transactionId,
+      }),
+    ).toBe(0);
+    expect(
+      await verifyEm.count(OutboxMessageEntity, {
+        aggregateId: pending.transactionId,
+        eventType: 'WagerTransactionRejected',
+      }),
+    ).toBe(1);
+  }, 20_000);
+
+  it('lets competing workers recover an abandoned lease without double-processing', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const processWager = new ProcessWager(orm.em);
+    const extraWorker = new PendingReferenceWorker(orm.em, processWager);
+    extraWorker.onApplicationBootstrap();
+    try {
+      const providerId = `pending-reference-race-${randomUUID()}`;
+      const referenceExternalTransactionId = randomUUID();
+      const pending = await processWager.execute({
+        providerId,
+        externalTransactionId: randomUUID(),
+        idempotencyKey: randomUUID(),
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'pending-reference-race',
+        kind: WagerTransactionKind.Win,
+        money: { amount: '15.00', currency: 'BRL' },
+        referenceExternalTransactionId,
+      });
+      const pendingEm = orm.em.fork({ clear: true });
+      const pendingRow = await pendingEm.findOneOrFail(
+        WagerTransactionEntity,
+        { id: pending.transactionId },
+      );
+      await processWager.execute({
+        providerId,
+        externalTransactionId: referenceExternalTransactionId,
+        idempotencyKey: randomUUID(),
+        playerId,
+        walletId,
+        roundId: pendingRow.roundId,
+        gameId: 'pending-reference-race',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '10.00', currency: 'BRL' },
+      });
+      pendingRow.pendingReferenceNextAttemptAt = new Date(Date.now() - 1_000);
+      pendingRow.pendingReferenceLeaseToken = randomUUID();
+      pendingRow.pendingReferenceLeaseUntil = new Date(Date.now() - 1_000);
+      await pendingEm.flush();
+
+      await waitUntil(async () => {
+        const readEm = orm.em.fork({ clear: true });
+        const wager = await readEm.findOneOrFail(WagerTransactionEntity, {
+          id: pending.transactionId,
+        });
+        return wager.status === 'PROCESSED';
+      });
+
+      const verifyEm = orm.em.fork({ clear: true });
+      expect(
+        await verifyEm.count(WalletLedgerEntryEntity, {
+          transactionId: pending.transactionId,
+        }),
+      ).toBe(1);
+      expect(
+        await verifyEm.count(OutboxMessageEntity, {
+          aggregateId: pending.transactionId,
+          eventType: 'WagerTransactionProcessed',
+        }),
+      ).toBe(1);
+      expect((await verifyEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '105.00',
+      );
+    } finally {
+      await extraWorker.onModuleDestroy();
+    }
+  }, 20_000);
 });
 
 async function createWallet(
@@ -244,4 +451,16 @@ async function postBet(
     },
     body: JSON.stringify(body),
   });
+}
+
+async function waitUntil(
+  predicate: () => Promise<boolean>,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('Timed out waiting for pending-reference worker result');
 }

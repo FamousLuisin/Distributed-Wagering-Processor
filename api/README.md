@@ -55,6 +55,19 @@ Durante o processamento, a visibilidade é renovada a cada 30 segundos. No
 SIGTERM, a aplicação para de buscar mensagens e espera o processamento em curso
 terminar antes de fechar o cliente SQS.
 
+O `PendingReferenceWorker` também inicia com a API e verifica o PostgreSQL a
+cada segundo. Pendências recebem primeira tentativa após 1 segundo, expiram em
+15 minutos e têm até 8 tentativas, com backoff exponencial limitado a 60
+segundos. Ele reivindica lotes de até 10 linhas por lease e usa
+`FOR UPDATE SKIP LOCKED`, permitindo mais de uma instância sem reivindicar a
+mesma linha ao mesmo tempo. Quando a referência aparece, o worker chama as
+mesmas regras financeiras de `ProcessWager`; saldo, ledger, estado terminal e
+eventos da outbox são persistidos na mesma transação. Referências que continuam
+ausentes ao esgotar o limite são rejeitadas com `REFERENCE_NOT_FOUND`. No
+encerramento, o worker para novas consultas e aguarda o lote já reivindicado;
+se ocorrer uma falha técnica, o lease expira em 60 segundos para permitir nova
+tentativa por outra instância.
+
 Comandos de manutenção:
 
 ```bash
