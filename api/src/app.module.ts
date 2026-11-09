@@ -4,12 +4,14 @@ import { HealthModule } from './modules/health/health.module.js';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { WageringModule } from './modules/wagering/wagering.module.js';
 import { MessagingModule } from './modules/messaging/messaging.module.js';
+import { WalletsModule } from './modules/wallets/wallets.module.js';
 
 @Module({
   imports: [
     MikroOrmModule.forRoot(mikroOrmConfig),
     HealthModule,
     WageringModule,
+    WalletsModule,
     MessagingModule,
   ],
 })

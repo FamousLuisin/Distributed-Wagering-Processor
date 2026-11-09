@@ -9,6 +9,17 @@ Documento de transferência para continuar o projeto em outra conversa. Baseado 
 - **Planejado/sugerido**: direção discutida, ainda sem implementação confirmada.
 - **Desconhecido**: não há evidência suficiente; não presumir.
 
+## Addendum atual — API financeira
+
+Este addendum supersede as afirmações anteriores deste handoff sobre ausência
+de mensageria, worker de referências e endpoints de consulta; essas seções foram
+escritas antes da implementação correspondente. O código atual também contém
+`POST /wallets` com abertura `OPENING` e crédito de ledger atômicos para saldo
+inicial positivo, `GET /wallets/:walletId`, ledger paginado por cursor, busca de
+transação por ID interno/externo e `POST /wallets/:walletId/reconciliation`.
+Esses fluxos foram adicionados nesta etapa, mas build e testes ainda não foram
+executados nesta etapa.
+
 ## 1. Visão geral do projeto
 
 ### Objetivo

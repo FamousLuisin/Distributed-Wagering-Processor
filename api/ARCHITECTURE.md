@@ -113,8 +113,9 @@ permitido. `REFUND` e `ROLLBACK` precisam usar o mesmo valor da referência e s�
 podem ocorrer uma vez por referência e tipo. Uma referência informada que ainda
 não existe fica `PENDING_REFERENCE` e retorna HTTP `202`; referências inválidas,
 saldo insuficiente ou reversão duplicada são registradas como `REJECTED` com
-`failureCode`. O worker que reprocessará as pendências ainda será implementado
-no módulo de mensageria.
+`failureCode`. O `PendingReferenceWorker` agenda novas tentativas com backoff,
+reivindica linhas com lease e `SKIP LOCKED`, e chama as mesmas regras financeiras.
+Ao esgotar oito tentativas ou 15 minutos, rejeita com `REFERENCE_NOT_FOUND`.
 
 `POST /wagering/transactions` aceita `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK`;
 `OPENING` é interno. `WIN` e `LOSS` podem informar referência de `BET`; `REFUND`
@@ -124,13 +125,28 @@ retorna `400`, conflitos de idempotência/ID externo retornam `409`, wallet
 ausente retorna `404` e incompatibilidades de jogador/moeda retornam `422`. A
 autenticação permanece fora do escopo, conforme decisão da seção 2 do desafio.
 
+## API de wallets e reconciliação
+
+`WalletApplicationService` abre a wallet e, para saldo inicial positivo, grava
+wallet, transação interna `OPENING`, crédito do ledger e os eventos
+`WagerTransactionProcessed`/`WalletBalanceChanged` na mesma transação SQL. Uma
+wallet com saldo inicial zero não cria lançamento. A unicidade de
+`(player_id, currency)` no PostgreSQL transforma criação duplicada em conflito.
+
+O módulo expõe leitura da wallet, ledger paginado por cursor opaco baseado em
+`(createdAt, id)`, busca de wager pelo ID interno ou pelo par
+`(providerId, externalTransactionId)`, e reconciliação. A reconciliação bloqueia
+a wallet para leitura enquanto percorre o ledger em ordem estável; compara a
+cadeia de saldos e o saldo calculado ao saldo materializado. Divergências são
+devolvidas sem correção automática e geram log estruturado.
+
 ## Outbox e eventos de integração
 
 A migration `Migration20261109000000` cria `inbox_messages` com chave composta
 `(consumer_name, message_id)` e `outbox_messages` com payload JSONB, tentativas,
-próxima tentativa, publicação e lease de publisher. A inbox e seu modelo de
-domínio estão prontos para deduplicação pelo consumer; ainda não são escritos
-porque o consumer SQS será implementado na próxima etapa.
+próxima tentativa, publicação e lease de publisher. O consumer escreve a inbox
+junto com o processamento financeiro; o caso de uso grava a outbox na mesma
+transação, e o publisher envia os eventos depois do commit.
 
 `ProcessWager` cria um evento tipado e sua linha de outbox dentro da mesma
 transação PostgreSQL que grava a wager, atualiza a wallet e persiste o ledger.

@@ -129,3 +129,41 @@ uma operação aguardando a referência retorna `202` com `PENDING_REFERENCE`.
 Rejeições de negócio, como saldo insuficiente ou reversão duplicada, aparecem no
 corpo como `status: REJECTED` e trazem um `failureCode`. A chave de idempotência
 é obrigatória no header.
+
+## Wallets, consultas e reconciliação
+
+Crie uma wallet enviando `playerId` e `initialBalance`:
+
+```http
+POST /wallets
+Content-Type: application/json
+```
+
+```json
+{
+  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+  "initialBalance": { "amount": "1000.00", "currency": "BRL" }
+}
+```
+
+Quando o saldo inicial é maior que zero, a API grava wallet, transação interna
+`OPENING`, crédito no ledger e os eventos da outbox na mesma transação SQL. Para
+saldo inicial zero, cria apenas a wallet. Outra wallet para o mesmo jogador e
+moeda retorna `409 WALLET_ALREADY_EXISTS`.
+
+Rotas de leitura disponíveis:
+
+- `GET /wallets/:walletId`
+- `GET /wallets/:walletId/ledger?cursor=<cursor>&limit=50`
+- `GET /wagering/transactions/:transactionId`
+- `GET /providers/:providerId/wagering/transactions/:externalTransactionId`
+
+A listagem do ledger ordena por `createdAt` e ID e retorna `items`, `hasMore` e
+`nextCursor`. O cursor é opaco; use o valor retornado na próxima chamada. O
+limite padrão é 50 e o máximo é 100.
+
+`POST /wallets/:walletId/reconciliation` reconstrói o saldo pela sequência do
+ledger e compara com o saldo materializado. A resposta inclui os dois saldos,
+diferença, `consistent` e quantidade de lançamentos verificados. Divergências
+são sinalizadas na resposta e em log estruturado; o endpoint não ajusta saldo ou
+ledger automaticamente.
