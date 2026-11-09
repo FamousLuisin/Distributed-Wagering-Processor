@@ -4,16 +4,19 @@ import {
   Get,
   NotFoundException,
   Param,
+  UseGuards,
 } from '@nestjs/common';
 import {
   WagerTransactionNotFoundError,
   WagerTransactionQueryService,
 } from '../application/wager-transaction-query.service.js';
+import { AuthGuard } from '../../identity/auth.guard.js';
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Controller()
+@UseGuards(AuthGuard)
 export class WagerTransactionQueryController {
   constructor(private readonly queries: WagerTransactionQueryService) {}
 

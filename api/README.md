@@ -45,8 +45,9 @@ antes de marcar a outbox, a mensagem pode ser enviada novamente depois que o
 lease expirar; consumidores devem deduplicar pelo `eventId`.
 
 Com `SQS_TRANSACTIONS_QUEUE_URL`, o consumer faz long polling de uma mensagem
-por vez e usa `ProcessWager`. O `messageId` do envelope e o hash SHA-256 do body
-formam a chave durável da inbox. O ACK (DeleteMessage) acontece somente depois
+por vez e usa `ProcessWager`. O `consumerName` e o `messageId` do envelope
+formam a chave durável da inbox; o hash SHA-256 do body detecta reutilização do
+ID com outro conteúdo. O ACK (DeleteMessage) acontece somente depois
 que o use case confirma seu commit; erros de negócio terminais também registram
 a inbox antes do ACK. Payloads inválidos são copiados à DLQ antes de remover a
 mensagem original. Falhas técnicas não recebem ACK e ganham backoff de
@@ -70,6 +71,12 @@ PostgreSQL de deadlock/lock/serialização, quantidade e idade da outbox pendent
 além da duração do processamento financeiro, consumo SQS e publicação da
 outbox. Um scraper deve coletar cada instância; os contadores em memória zeram
 quando o processo reinicia.
+
+Autenticação está fora do escopo do desafio. As rotas de wallets e wagering
+passam pelo `AuthGuard` no-op em `src/modules/identity`, que atualmente permite
+todas as chamadas e marca onde conectar um IdP OIDC externo no futuro. As rotas
+de health permanecem abertas. Consulte `ARCHITECTURE.md` para a decisão e o
+desenho futuro.
 
 Os logs de processamento financeiro, consumer, publisher, worker de referências
 e reconciliação são JSON estruturado. Compartilham timestamp, nível, componente,
@@ -102,23 +109,28 @@ trigger append-only do ledger que não são expressos apenas pelos EntitySchemas
 revise e preserve essas garantias ao criar migrations futuras.
 Não use `schema:update` em ambientes compartilhados: alterações de schema devem
 entrar em uma migration revisável.
+`db:migration:check` pode sugerir remover constraints, FKs e o trigger que só
+existem no SQL das migrations. Revise o diff; não o aplique automaticamente.
 
 ## Validar concorrência de apostas
 
-O caso crítico usa PostgreSQL real para conferir o lock da wallet. Com o banco
-local iniciado e na pasta `api`, execute:
+Os testes de integração usam PostgreSQL e LocalStack reais. Com os serviços
+locais iniciados e na pasta `api`, execute:
 
 ```bash
 bun run test:integration
 ```
 
-O teste aplica migrations pendentes e dispara, ao mesmo tempo, duas apostas de
-R$ 80 em uma wallet com R$ 100. Ele verifica que uma fica `PROCESSED`, a outra
-`REJECTED` por saldo insuficiente, o saldo termina em R$ 20 e existe apenas um
-lançamento de débito. A mesma suíte também envia requisições pela rota HTTP para
-confirmar replay idempotente e conflito quando a chave é reutilizada com outro
-payload. Como o ledger é append-only, os registros criados pelo teste permanecem
-no banco; use um banco local descartável para essa validação.
+As suites verificam, entre outros cenários: duas apostas de R$ 80 simultâneas
+contra saldo de R$ 100; o mesmo wager enviado 50 vezes; wallets diferentes em
+paralelo; três instâncias Nest concorrentes; replay e conflito idempotente;
+referências ausentes, expiração, recuperação e reversões antes da BET;
+deduplicação de inbox, retry transitório do consumer, DLQ de contrato inválido,
+publishers concorrentes, recuperação após restart simulado, shutdown e
+consistência sistemática entre wallet e ledger. As três instâncias e o restart
+são simulados dentro do mesmo processo de teste, não como processos de SO
+separados. Como o ledger é append-only, os dados criados permanecem no banco;
+use uma base local descartável para essa validação.
 
 ## Endpoint de aposta
 
@@ -187,4 +199,5 @@ limite padrão é 50 e o máximo é 100.
 ledger e compara com o saldo materializado. A resposta inclui os dois saldos,
 diferença, `consistent` e quantidade de lançamentos verificados. Divergências
 são sinalizadas na resposta e em log estruturado; o endpoint não ajusta saldo ou
-ledger automaticamente.
+ledger automaticamente. Cada divergência também incrementa
+`wallet_reconciliation_mismatches_total`.

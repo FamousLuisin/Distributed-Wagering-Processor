@@ -6,7 +6,7 @@ mais de um módulo. Dependências devem apontar para dentro: apresentação cham
 aplicação, aplicação coordena domínio e portas, infraestrutura implementa as
 portas.
 
-## Estrutura planejada
+## Estrutura atual
 
 ```text
 src/
@@ -14,45 +14,42 @@ src/
   app.module.ts
   modules/
     health/
-      presentation/
+      presentation/health.controller.ts
       health.module.ts
     wallets/
       domain/             # Wallet, Money e regras de saldo
-      application/        # abrir, consultar e reconciliar wallet
-      infrastructure/    # repositório MikroORM e mapeamentos
-      presentation/       # controllers, DTOs e validação HTTP
+      application/        # abertura, consulta e reconciliação
+      infrastructure/     # EntitySchema MikroORM
+      presentation/       # controller e parsers HTTP
       wallets.module.ts
     wagering/
-      domain/             # WagerTransaction, regras e eventos de domínio
-      application/        # submissão, processamento e referências pendentes
-      infrastructure/    # repositórios MikroORM e adaptadores
-      presentation/       # endpoints e contratos HTTP
+      domain/             # WagerTransaction, regras e eventos
+      application/        # processamento, queries e worker de referência
+      infrastructure/     # EntitySchema MikroORM
+      presentation/       # controllers e parser HTTP
       wagering.module.ts
     ledger/
-      domain/             # lançamentos imutáveis e regras de consistência
-      application/        # consulta paginada e reconciliação
-      infrastructure/    # persistência e migrations relacionadas
-      presentation/       # consulta de ledger, se exposta separadamente
-      ledger.module.ts
+      domain/             # lançamentos imutáveis
+      infrastructure/    # EntitySchema MikroORM
     messaging/
-      application/        # casos de uso de inbox/outbox e workers
-      infrastructure/    # adaptadores SQS, publisher e scheduler
+      domain/             # inbox, outbox e envelope de evento
+      application/        # consumer e publisher SQS
+      infrastructure/    # EntitySchema e clientes SQS
       messaging.module.ts
-    identity/             # ponto de extensão para IdP/guards; sem auth artesanal
+    identity/             # AuthGuard no-op como ponto de extensão
   shared/
-    domain/               # tipos/erros base realmente compartilhados
-    application/          # contratos como clock e unit of work, se necessários
-    infrastructure/       # configuração e adaptadores transversais
+    domain/               # LedgerDirection compartilhado
+    observability/        # registry de métricas e logs JSON estruturados
   database/
     mikro-orm.config.ts
     migrations/
 ```
 
 Os diretórios de `domain`, `application`, `infrastructure` e `presentation`
-serão criados dentro de cada módulo conforme houver código para eles; não
-precisam de arquivos vazios. `identity` é somente o ponto de extensão previsto
-pelo desafio: autenticação pode ficar fora do escopo e essa decisão deve ser
-documentada.
+são criados conforme há código para eles; não precisam de arquivos vazios.
+`identity` contém o guard HTTP no-op exigido como ponto de extensão, não um
+mecanismo de autenticação ativo. O ledger está distribuído entre seu domínio e
+as camadas de wallets/wagering; não há um `LedgerModule` autônomo.
 
 ## Responsabilidades
 
@@ -62,13 +59,15 @@ documentada.
 - `messaging`: inbox, outbox, integração SQS e recuperação de mensagens.
 - `health`: liveness, readiness do PostgreSQL/SQS e endpoint Prometheus de
   métricas operacionais.
+- `identity`: `AuthGuard` no-op anexado às rotas HTTP financeiras; local para
+  integração futura com um provedor de identidade externo.
 - `database`: configuração do MikroORM e migrations versionadas/reversíveis.
 - `shared`: não deve virar uma pasta genérica; tipos permanecem no módulo dono
   até existir uma necessidade real de compartilhamento.
 
-O fluxo financeiro será orquestrado por um caso de uso de `wagering`, usando
-uma transação MikroORM para persistir transação, wallet, ledger, inbox (quando
-aplicável) e outbox de forma atômica.
+O fluxo financeiro é orquestrado por `ProcessWager`, usando uma transação
+MikroORM para persistir transação, wallet, ledger, inbox (quando aplicável) e
+outbox de forma atômica.
 
 ## Persistência inicial
 
@@ -80,14 +79,17 @@ por wallet. As garantias de unicidade, saldo não negativo, aritmética do ledge
 e ledger append-only também estão na migration SQL, para continuarem valendo
 com mais de uma instância.
 
-A primeira migration cria `wallets`, `wager_transactions` e
-`wallet_ledger_entries`. A migration seguinte adiciona o snapshot
-`resulting_balance` usado para responder replays. A primeira migration também impõe unicidade global da chave de
+As migrations `Migration20261107000000` a `Migration20261110000000` criam as
+tabelas financeiras, o snapshot `resulting_balance`, inbox/outbox e os
+campos/índices de agenda e lease das referências pendentes. A migration inicial
+impõe unicidade global da chave de
 idempotência, unicidade por provedor/ID externo, uma reversão por referência e
-tipo, no máximo um lançamento por transação/wallet, e um trigger que rejeita
-UPDATE/DELETE do ledger. O formato do código de moeda é validado como três letras
-maiúsculas; a lista ISO-4217 não é mantida dentro do domínio, conforme decisão
-de escopo.
+tipo, no máximo um lançamento por transação/wallet, FKs, checks e trigger que
+rejeita UPDATE/DELETE do ledger. Parte dessas garantias SQL não é representada
+integralmente nos `EntitySchema`; `db:migration:check` já foi observado
+propondo removê-las. Diff gerado não deve ser aplicado sem revisão. O formato
+do código de moeda é validado como três letras maiúsculas; não se mantém
+catálogo ISO-4217, conforme decisão de escopo.
 
 ## Processamento de transações de aposta
 
@@ -125,6 +127,25 @@ retorna `400`, conflitos de idempotência/ID externo retornam `409`, wallet
 ausente retorna `404` e incompatibilidades de jogador/moeda retornam `422`. A
 autenticação permanece fora do escopo, conforme decisão da seção 2 do desafio.
 
+## Autenticação e identidade
+
+Não implementamos autenticação neste desafio. As rotas de
+wallets e wagering já passam por `AuthGuard`, mas a implementação atual é
+intencionalmente no-op e permite todas as chamadas. Isso deixa um ponto de
+substituição explícito sem criar a falsa impressão de que as rotas estão
+protegidas. `/health/live`, `/health/ready` e `/health/metrics` não usam o guard
+e permanecem abertos, como pede o enunciado.
+
+Como evolução, integraríamos um IdP OIDC externo (por exemplo Keycloak ou
+Zitadel), sem tabela local de senhas. O guard validaria assinatura, emissor,
+audience e expiração do token, e disponibilizaria o principal autenticado no
+request. Para operações de provedor, a identidade/claim do token deveria ser
+vinculada ao `providerId` informado na requisição. Mensagens SQS são tratadas
+como canal interno confiável pelo desafio, mas `providerId`, wallet, jogador,
+referências e demais invariantes continuam passando pelas validações de domínio
+de `ProcessWager`. Ao implementar auth, substituir `AuthGuard` e adicionar essa
+vinculação; os controllers já aplicam o guard.
+
 ## API de wallets e reconciliação
 
 `WalletApplicationService` abre a wallet e, para saldo inicial positivo, grava
@@ -138,7 +159,8 @@ O módulo expõe leitura da wallet, ledger paginado por cursor opaco baseado em
 `(providerId, externalTransactionId)`, e reconciliação. A reconciliação bloqueia
 a wallet para leitura enquanto percorre o ledger em ordem estável; compara a
 cadeia de saldos e o saldo calculado ao saldo materializado. Divergências são
-devolvidas sem correção automática e geram log estruturado.
+devolvidas sem correção automática, geram log estruturado e incrementam
+`wallet_reconciliation_mismatches_total`.
 
 ## Outbox e eventos de integração
 
@@ -160,7 +182,8 @@ O `OutboxPublisher` reivindica lotes com `FOR UPDATE SKIP LOCKED`, atribui um
 lease de 60 segundos e confirma essa reivindicação antes de chamar o SQS. O envio
 acontece fora da transação SQL. A linha só recebe `published_at` depois do ACK
 positivo do SQS; erros liberam o lease e agendam retry exponencial de 1 segundo
-até 5 minutos, sem descartar a mensagem. O envio FIFO usa `aggregateId` como
+até 5 minutos, sem limite de tentativas nem descarte automático. Publica até 10
+eventos concorrentes por batch. O envio FIFO usa `aggregateId` como
 `MessageGroupId` e `eventId` como `MessageDeduplicationId`.
 
 Existe uma janela inevitável entre o SQS aceitar a mensagem e o banco confirmar
@@ -171,6 +194,11 @@ publisher antigo não atualizar uma linha que outro publisher já reivindicou.
 O publisher roda no processo da API quando `SQS_EVENTS_QUEUE_URL` está
 configurada. Sem essa configuração, os eventos ficam duráveis na outbox e um
 aviso é registrado.
+
+Como os envios dentro da batch são concorrentes, o código não garante que dois
+eventos do mesmo agregado sejam aceitos pelo SQS na ordem em que foram gravados
+na outbox. A fila FIFO preserva a ordem de aceite por grupo, mas não serializa
+as chamadas concorrentes de publicação.
 
 O `SqsWagerConsumer` faz long polling de uma mensagem por vez da fila de entrada
 e passa o payload validado ao mesmo `ProcessWager` usado pelo HTTP. Para mensagens
@@ -209,4 +237,33 @@ repositórios e à wallet.
 valor e saldos, saldo final não negativo e aritmética consistente: débito subtrai
 o valor e crédito soma. `LOSS` não gera lançamento. `ROLLBACK` inverte a direção
 do BET/WIN/REFUND processado que referencia. A restrição de um lançamento por
-transação/wallet também será aplicada por índice único no banco.
+transação/wallet é aplicada por índice único no banco.
+
+## Health, logs e métricas
+
+`GET /health/live` verifica que o processo HTTP responde. `GET /health/ready`
+faz probe de PostgreSQL e das três filas configuradas (entrada, DLQ e eventos),
+com timeout de 3 segundos. Sem configuração ou acesso, retorna `503`. Os
+endpoints de health permanecem abertos.
+
+`GET /health/metrics` expõe texto Prometheus, gerado por um registry em memória.
+O código registra contadores de transações por status, duplicatas, retries,
+envios e mensagens visíveis na DLQ, conflitos SQL de lock/deadlock, tamanho e
+idade da outbox, latência de processamento e divergências de reconciliação. Os
+valores zeram em restart e são locais a cada instância; não há Prometheus,
+OpenTelemetry ou dashboard no Compose.
+
+Logs JSON dos fluxos financeiros e workers usam campos comuns de timestamp,
+level, component, event, correlationId, messageId, transactionId, walletId,
+providerId, externalTransactionId, status, errorCode e durationMs. Campos sem
+valor ficam `null`; payload financeiro completo não é registrado.
+
+## Limitações de validação
+
+Os testes de três instâncias Nest e restart rodam dentro de um mesmo processo de
+teste; não são três processos do sistema operacional nem encerramento forçado.
+Os testes cobrem concorrência de publishers e retry transitório do consumer,
+mas não injetam falha temporária no publisher até validar seu backoff, nem
+aguardam uma falha técnica chegar à DLQ pela redrive policy de cinco entregas.
+O registry de métricas é efêmero e publisher não tem DLQ própria nem limite de
+retries; eventos permanentemente problemáticos podem acumular na outbox.

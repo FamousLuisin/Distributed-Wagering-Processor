@@ -8,6 +8,7 @@ import {
   Headers,
   Body,
   Res,
+  UseGuards,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import type { Response } from 'express';
@@ -22,8 +23,10 @@ import {
 import { ProcessWager } from '../application/process-wager.js';
 import { WagerTransactionStatus } from '../domain/wager-transaction.types.js';
 import { parseSubmitWagerRequest } from './submit-wager.request.js';
+import { AuthGuard } from '../../identity/auth.guard.js';
 
 @Controller('wagering/transactions')
+@UseGuards(AuthGuard)
 export class WageringController {
   constructor(private readonly processWager: ProcessWager) {}
 

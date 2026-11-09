@@ -1,263 +1,197 @@
 # Project Handoff — Distributed Wagering Processor
 
-Documento de transferência para continuar o projeto em outra conversa. Baseado no histórico desta conversa e no estado observado do repositório em 08/11/2026. Quando há divergência, o código/Git observado descreve a implementação; a documentação pode descrever apenas intenção.
+Estado conferido no repositório em 09/11/2026. Este documento descreve o código
+observado nessa data. Se houver divergência, o código e as migrations são a
+fonte da verdade; comportamento ainda não validado em execução está identificado
+como limitação.
 
-## Como interpretar
+## Objetivo e stack
 
-- **Confirmado no código**: conferido nos arquivos atuais.
-- **Decisão do usuário**: preferência ou escolha expressa durante a conversa.
-- **Planejado/sugerido**: direção discutida, ainda sem implementação confirmada.
-- **Desconhecido**: não há evidência suficiente; não presumir.
+API para processar operações financeiras de wagering com saldo, transações,
+ledger, idempotência e mensageria durável. O desafio permite deixar autenticação
+fora do escopo, desde que a decisão e o ponto de extensão estejam documentados.
 
-## Addendum atual — API financeira
+- TypeScript strict, ESM/NodeNext, NestJS 12 e Express.
+- MikroORM 7 e PostgreSQL 17.
+- AWS SDK SQS v3; LocalStack SQS para desenvolvimento local.
+- Bun, Vitest, Oxlint e Prettier.
+- Docker Compose sobe PostgreSQL e LocalStack. `infra/localstack/init-queues.sh`
+  cria três filas FIFO.
 
-Este addendum supersede as afirmações anteriores deste handoff sobre ausência
-de mensageria, worker de referências e endpoints de consulta; essas seções foram
-escritas antes da implementação correspondente. O código atual também contém
-`POST /wallets` com abertura `OPENING` e crédito de ledger atômicos para saldo
-inicial positivo, `GET /wallets/:walletId`, ledger paginado por cursor, busca de
-transação por ID interno/externo e `POST /wallets/:walletId/reconciliation`.
-Esses fluxos foram adicionados nesta etapa, mas build e testes ainda não foram
-executados nesta etapa.
+## Estado implementado
 
-## 1. Visão geral do projeto
+### Fluxo financeiro
 
-### Objetivo
-API de processamento distribuído de operações de wagering/apostas, com wallet, saldo, transações e ledger. Prioridades conhecidas: correção financeira sob concorrência, não debitar duas vezes em repetição/redelivery e relacionar operações como refund/rollback às transações originais.
+`POST /wagering/transactions` chama `ProcessWager`. O caso de uso usa
+`EntityManager.transactional()`, lock pessimista da wallet e constraints do
+PostgreSQL para serializar alterações na mesma wallet e preservar unicidade.
+Wallet, transação, ledger, inbox (quando a entrada vem da fila) e eventos de
+outbox são gravados dentro da transação SQL aplicável.
 
-O desafio foi referido como “Technical Challenge — Distributed Wagering Processor Bem-vindo à Jungle Gaming”. O conteúdo completo do anexo não foi consultado nesta análise; confirmar nele os requisitos exatos, especialmente broker, retries e recuperação.
+Valores usam `Money` com decimal em string e `numeric(20,2)` no banco. A wallet
+tem saldo materializado; o ledger é append-only e registra saldo anterior e
+posterior. `OPENING` é uma transação interna usada para creditar saldo inicial
+positivo ao criar wallet.
 
-### Tecnologias confirmadas
-- TypeScript strict, ESM/NodeNext.
-- NestJS 12 + Express.
-- MikroORM 7 + PostgreSQL.
-- PostgreSQL 17 Alpine via Docker Compose.
-- Bun para dependências e scripts.
-- Vitest, Oxlint e Prettier.
-- Não há SDK de fila/SQS em `api/package.json` no estado observado.
+Tipos externos: `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`. `BET` debita;
+`WIN` credita; `LOSS` não altera saldo nem cria ledger. `REFUND` credita uma BET
+processada referenciada. `ROLLBACK` inverte a direção de BET, WIN ou REFUND
+processado que referencia. Referências precisam respeitar provedor, jogador,
+wallet, moeda, rodada, tipo e estado permitidos. Uma referência ausente deixa
+REFUND/ROLLBACK em `PENDING_REFERENCE`.
 
-### Estado atual
-Há domínios Money, Wallet, WagerTransaction e ledger; persistência/migrations; caso de uso síncrono `ProcessWager`; endpoint HTTP; lock pessimista da wallet; idempotência; regras BET/WIN/LOSS/REFUND/ROLLBACK.
+`Idempotency-Key` é única globalmente. O payload de negócio é normalizado e
+hashado com SHA-256, sem incluir a chave de idempotência. Mesmo chave e mesmo
+payload devolvem o snapshot persistido; mesmo chave com payload diferente
+conflita. O lock é por wallet, então wallets distintas podem processar em
+paralelo.
 
-**Fila, SQS, inbox/outbox, workers e recuperação/retry não estão implementados.** A arquitetura cita esses itens e o usuário indicou que integração de fila e recuperação deve ser prioridade em relação a endpoints de consulta.
+### Inbox, outbox e SQS
 
-## 2. Arquitetura e estrutura
+- `InboxMessageEntity`: chave composta `(consumer_name, message_id)` e hash do
+  corpo. Redelivery de mensagem já processada recebe ACK sem repetir efeitos.
+- `OutboxMessageEntity`: evento JSONB persistido junto com a alteração
+  financeira. O publisher só chama SQS depois do commit SQL.
+- Eventos versionados: `WagerTransactionProcessed`,
+  `WagerTransactionRejected`, `WagerTransactionPendingReference` e
+  `WalletBalanceChanged`. A abertura de wallet positiva também emite eventos.
+- Publisher: polling de 1 s, lotes de até 10, claim com `FOR UPDATE SKIP LOCKED`,
+  lease de 60 s, publicação concorrente e confirmação condicional pelo token do
+  lease. Retry exponencial começa em 1 s e limita o intervalo a 5 min. Não há
+  limite de tentativas nem descarte automático: falhas permanecem na outbox.
+- O envio FIFO usa `aggregateId` como `MessageGroupId` e `eventId` como
+  `MessageDeduplicationId`. Uma queda após aceite pelo SQS, mas antes de marcar
+  `published_at`, pode duplicar publicação. A garantia é at-least-once.
+- Consumer: lê uma mensagem por vez com long polling de até 20 s; valida o
+  envelope, chama o mesmo `ProcessWager` do HTTP e só apaga a mensagem após o
+  commit. Visibilidade é 60 s, renovada a cada 30 s. Retry técnico ajusta a
+  visibilidade com backoff exponencial limitado a 60 s.
+- Mensagem de contrato inválido ou conflito de inbox é copiada para a DLQ antes
+  do ACK da original. Falhas técnicas ficam na fila; a redrive policy local
+  encaminha para DLQ após cinco entregas. Erros de negócio terminais gravam a
+  inbox antes do ACK.
+- No encerramento, consumer aguarda a operação atual; o publisher espera o loop
+  e as publicações do lote. O worker de referências termina o lote reivindicado.
 
-### Árvore atual relevante
-```
-api/src/
-  app.module.ts
-  main.ts
-  database/
-    mikro-orm.config.ts
-    migrations/Migration20261107000000.ts
-    migrations/Migration20261108000000.ts
-  modules/
-    health/
-      health.module.ts
-      presentation/health.controller.ts
-    wallets/
-      domain/
-        money.ts, money.props.ts, money.errors.ts, money.spec.ts
-        wallet.ts, wallet.state.ts, wallet.balance-change.ts
-        wallet.errors.ts, wallet.spec.ts
-      infrastructure/wallet.entity.ts
-    wagering/
-      domain/
-        wager-transaction.ts, wager-transaction.types.ts
-        wager-transaction.errors.ts, wager-transaction.spec.ts
-      application/
-        process-wager.ts, process-wager.types.ts, process-wager.errors.ts
-        process-wager.integration.spec.ts
-      infrastructure/wager-transaction.entity.ts
-      presentation/wagering.controller.ts, submit-wager.request.ts
-      wagering.module.ts
-    ledger/
-      domain/
-        wallet-ledger-entry.ts, wallet-ledger-entry.types.ts
-        wallet-ledger-entry.errors.ts, wallet-ledger-entry.spec.ts
-      infrastructure/wallet-ledger-entry.entity.ts
-  shared/domain/ledger-direction.ts
-```
+### Referências pendentes
 
-`api/ARCHITECTURE.md` descreve também módulos planejados: messaging, identity e camadas completas de application/infrastructure/presentation para wallets e ledger. Eles não aparecem na árvore atual e não devem ser descritos como implementados. `app.module.ts` registra HealthModule e WageringModule.
+`PendingReferenceWorker` consulta o banco a cada segundo, reivindica até 10
+linhas com `SKIP LOCKED` e lease de 60 s, e reusa as regras de `ProcessWager`.
+As pendências vencem em 15 minutos ou após oito tentativas. A primeira tentativa
+fica devida após 1 s; os intervalos seguintes crescem exponencialmente e são
+limitados a 60 s. Se a referência não aparecer, a operação termina rejeitada
+com `REFERENCE_NOT_FOUND`. Saldo, ledger, estado e outbox são atualizados na
+transação de recuperação.
 
-### Responsabilidades e fluxo
-- `wallets`: Money, agregado Wallet e regras de saldo.
-- `wagering`: tipos/regras da transação, referências e coordenação do processamento.
-- `ledger`: lançamento imutável.
-- `health`: liveness; readiness conectada a banco/fila não confirmada.
-- `database`: configuração MikroORM e migrations.
-- `shared/domain`: LedgerDirection usado por mais de um módulo.
-- `messaging`: SQS, inbox/outbox e workers são planejados, ausentes.
+### API financeira e consultas
 
-Fluxo atual: controller recebe POST e `Idempotency-Key` → parser valida body → `ProcessWager` normaliza Money/calcula hash → transação MikroORM → consulta idempotência → lock pessimista na linha da wallet → nova consulta da chave → resolve conflitos e referência → aplica regra do domínio → grava wager e, se aplicável, wallet/ledger na mesma transação SQL → responde. É fluxo **síncrono**, não usa fila.
+- `POST /wallets`: cria wallet; para saldo inicial positivo, grava wallet,
+  `OPENING`, crédito de ledger e outbox na mesma transação.
+- `GET /wallets/:walletId` e `GET /wallets/:walletId/ledger`: leitura do saldo
+  e ledger paginado por cursor opaco estável (`createdAt`, ID).
+- `POST /wallets/:walletId/reconciliation`: recalcula e compara saldo e cadeia
+  do ledger, devolve divergência, registra log e métrica; não corrige dados.
+- `POST /wagering/transactions`: processa operações externas.
+- `GET /wagering/transactions/:transactionId` e
+  `GET /providers/:providerId/wagering/transactions/:externalTransactionId`:
+  consultam transação.
+- Health: `/health/live`, `/health/ready`, `/health/metrics`.
 
-## 3. Implementações realizadas
+### Autenticação
 
-### Money e Wallet
-- Arquivos em `api/src/modules/wallets/domain/`: Money, props/erros/specs; Wallet, estado, mudança de saldo, erros/specs.
-- Valores monetários persistidos como `numeric(20,2)` e tratados como string decimal.
-- **Decisão do usuário**: não implementar validação contra lista ISO-4217; formato de moeda de três letras maiúsculas existe como regra de formato no banco.
-- Verificar os arquivos antes de ampliar precisão/escala ou API dos agregados.
+`api/src/modules/identity/AuthGuard` é aplicado às rotas financeiras, mas é
+intencionalmente no-op: todas as chamadas HTTP são permitidas. Health permanece
+aberto. Não há autenticação real nem tabela local de senhas. A evolução
+documentada é integrar um IdP OIDC externo e vincular principal/claim ao
+`providerId`. A fila é tratada como canal interno confiável, mas as mensagens
+continuam sujeitas às validações de domínio.
 
-### WagerTransaction e ledger
-- Arquivos em `api/src/modules/wagering/domain/` e `api/src/modules/ledger/domain/`.
-- Tipos conhecidos: OPENING, BET, WIN, LOSS, REFUND, ROLLBACK; estados PENDING, PENDING_REFERENCE, PROCESSED, REJECTED, FAILED.
-- OPENING é interno e possui factory separada; endpoint não aceita.
-- Ledger é imutável. Débito subtrai, crédito soma; LOSS não gera ledger.
-- ROLLBACK inverte BET/WIN/REFUND processada que referencia; REFUND credita BET processada.
-- Domínio valida transições e direção; validações que exigem persistência (ownership, rodada, duplicidade) são coordenadas pelo use case.
+## Persistência e migrations
 
-### Banco e migrations
-- Configuração: `api/src/database/mikro-orm.config.ts`.
-- Entidades: `wallet.entity.ts`, `wager-transaction.entity.ts`, `wallet-ledger-entry.entity.ts`.
-- Migration 20261107000000 cria wallets, wager_transactions e wallet_ledger_entries, com checks, FKs, índices e constraints. Inclui unicidade wallet por jogador/moeda, idempotency key, provider/external ID, reversão por referência/tipo, ledger por wallet/transação; trigger proíbe UPDATE/DELETE do ledger.
-- Migration 20261108000000 acrescenta `resulting_balance` para snapshot de replay.
-- Migrations são transacionais; README orienta não usar schema:update em ambientes compartilhados.
+Migrations em `api/src/database/migrations`:
 
-### ProcessWager, referências e operações
-Arquivo principal: `api/src/modules/wagering/application/process-wager.ts`.
+1. `Migration20261107000000`: wallets, transações, ledger, FKs, constraints,
+   índices e trigger append-only.
+2. `Migration20261108000000`: snapshot `resulting_balance` para replay.
+3. `Migration20261109000000`: inbox e outbox, constraints e índices de claim.
+4. `Migration20261110000000`: agenda, limite, expiração e lease de referências
+   pendentes.
 
-- Hash SHA-256 do JSON canônico de campos de negócio: external transaction ID, game, kind, Money, player, provider, reference external ID, round e wallet. Chave de idempotência é excluída do hash; chaves do JSON são ordenadas recursivamente.
-- Mesmo idempotency key + mesmo hash: replay retorna snapshot original e `idempotentReplay: true`. Mesmo key com payload divergente gera conflito.
-- Lock `PESSIMISTIC_WRITE` somente na wallet serializa alterações da mesma carteira. Reconsulta chave após o lock.
-- Wager, atualização da wallet e ledger são persistidos no mesmo contexto transacional; wager é flushado antes do ledger para satisfazer FK, sem sair da transação SQL.
-- BET debita; saldo insuficiente fica REJECTED/INSUFFICIENT_FUNDS.
-- WIN credita; referência de BET é opcional.
-- LOSS registra sem mover saldo nem criar ledger; referência de BET opcional.
-- REFUND exige referência a BET processada e mesmo valor; credita uma vez.
-- ROLLBACK exige referência processada permitida (BET/WIN/REFUND), mesmo valor e só uma reversão por referência/tipo; inverte direção.
-- Referência precisa corresponder a provider, jogador, wallet, moeda, rodada, status e tipo permitidos.
-- Referência ausente gera PENDING_REFERENCE e HTTP 202; referência inválida é rejeitada com failureCode. **O reprocessamento da pendência ainda não existe.**
-- Leia o código corrente antes de confiar em todas essas regras; testes específicos desses tipos estão ausentes.
+Migrations são transacionais. Alguns invariantes SQL, especialmente FKs,
+constraints e trigger append-only, não são representados integralmente pelos
+`EntitySchema`; `db:migration:check` já foi observado propondo remoções dessas
+garantias. Não aplicar esse diff automaticamente. Criar e revisar migrations
+manualmente e preservar o trigger financeiro.
 
-### Endpoint
-Arquivos: `api/src/modules/wagering/presentation/wagering.controller.ts`, `submit-wager.request.ts`, `wagering.module.ts`.
+## Observabilidade
 
-Rota `POST /wagering/transactions`; header `Idempotency-Key` obrigatório. Aceita BET/WIN/LOSS/REFUND/ROLLBACK, não OPENING. REFUND/ROLLBACK exigem referência. HTTP 200 para resultado final, 202 pending, 400 entrada inválida/valor não positivo, 409 conflitos, 404 wallet ausente, 422 player/moeda incompatíveis. Auth consta como fora do escopo na documentação; validar com o enunciado.
+`GET /health/ready` testa PostgreSQL (`SELECT 1`) e acessibilidade das URLs
+configuradas para fila de entrada, DLQ e eventos; probe tem timeout de 3 s.
+Sem qualquer URL, retorna `503`. Logs JSON compartilham timestamp, nível,
+componente, evento, IDs de correlação/mensagem/transação/wallet/provedor, status,
+código de erro e duração; não devem registrar payload financeiro completo.
 
-### Reimplementação depois do re-clone
-O usuário perdeu trabalho local por problema de Git e pediu reimplementar BET/WIN/LOSS/REFUND/ROLLBACK. Essa refatoração está no working tree atual, sem commit (ver seção 5). Substituiu nomes process-bet/submit-bet por process-wager/submit-wager.
+`GET /health/metrics` expõe Prometheus. Há métricas de status de transação,
+duplicatas, retries, mensagens na DLQ, conflitos SQL de lock/deadlock,
+quantidade/idade da outbox, latência de processamento, consumer e publisher, e
+divergências de reconciliação. A implementação é em memória e por processo:
+contadores zeram no restart; cada instância precisa ser coletada. O gauge de
+DLQ é aproximado pelo atributo do SQS.
 
-## 4. Decisões arquiteturais e técnicas
+## Testes e estado da validação
 
-| Decisão | Motivo/evidência | Estado |
-|---|---|---|
-| Organização modular por domínio/camadas | `api/ARCHITECTURE.md`; domínio sem dependência do ORM | Documentada e parcialmente aplicada |
-| MikroORM + PostgreSQL | Código atual; transação e lock relacional para saldo | Implementado |
-| Money com decimal/string e numeric SQL | Evitar aritmética monetária com float | Implementado/documentado |
-| Sem catálogo ISO-4217 | Usuário explicitamente dispensou | Decisão confirmada |
-| Constraints SQL para invariantes | Segurança mesmo com múltiplas instâncias | Implementado em migration |
-| Lock pessimista por wallet | Impedir overspending concorrente na mesma wallet | Implementado |
-| Hash para idempotência | Repetição igual retorna resultado original; alteração conflita | Implementado |
-| SQS/inbox/outbox/workers | Constam no architecture e usuário priorizou fila | Ainda não implementado; requisito específico do desafio não revalidado |
-| At-least-once + idempotência | Foi sugerido como abordagem de broker | Sugestão, não implementação/decisão final |
+Existem testes unitários dos domínios e integrações com PostgreSQL/LocalStack.
+Os cenários de integração cobrem duas apostas concorrentes, replay e conflito
+idempotente, recuperação/rejeição de referência, lease abandonado, 50 submits
+iguais concorrentes, wallets distintas, três aplicações Nest independentes,
+REFUND/ROLLBACK antes da referência, inbox/DLQ, retry transitório do consumer,
+publishers concorrentes, restart simulado e shutdown. Depois de cada cenário,
+saldo é comparado com ledger.
 
-O usuário perguntou “por que não MikroORM?”; projeto atual efetivamente usa MikroORM. Não há no histórico decisão aprovada de trocar ORM.
+Última validação registrada: `bun run test:integration` passou com 16 testes em
+09/11/2026 antes das mudanças posteriores de observabilidade e AuthGuard. Depois
+dessas mudanças, `bun run build` e `bun run lint` passaram; lint ainda aponta um
+aviso existente de `unbound-method` no teste de shutdown do worker. Os testes
+não simulam três processos do sistema operacional: são três instâncias Nest no
+mesmo processo. O crash/restart também é simulado fechando e recriando Nest.
 
-## 5. Problemas e correções
+## Limitações conhecidas / validações pendentes
 
-### Erro de tipo no integration spec
-`common.kind` era inferido como enum amplo, incluindo OPENING, incompatível com tipo externo de ProcessWager. Corrigido para `WagerTransactionKind.Bet as const` em `api/src/modules/wagering/application/process-wager.integration.spec.ts`. Depois foi executado `bun run build` em api e passou (`$ nest build`).
+- AuthGuard ainda permite qualquer chamada; é um ponto de extensão, não uma
+  proteção ativa.
+- Métricas são efêmeras e não há Prometheus server, scrape config, dashboard ou
+  OpenTelemetry no Compose.
+- A política de DLQ para falha técnica depende de redrive SQS; o teste de
+  integração cobre envio explícito de mensagem inválida à DLQ, mas não valida
+  uma falha técnica repetida até cinco entregas.
+- Não foi injetada falha transitória específica do publisher para validar
+  backoff e incremento da tentativa; publishers concorrentes e publicação foram
+  exercitados.
+- As três aplicações concorrentes e o restart são testes de instâncias Nest,
+  não processos separados nem encerramento forçado do SO.
+- Outbox não tem máximo de tentativas nem DLQ própria; evento problemático pode
+  permanecer pendente e elevar o lag até intervenção operacional.
+- Publisher envia mensagens da mesma batch com concorrência. SQS FIFO ordena pela
+  aceitação dentro do `MessageGroupId`, mas a ordem de aceite entre chamadas
+  concorrentes para o mesmo agregado não é garantida pelo código.
+- Dados gerados em integração permanecem no PostgreSQL local; ledger é
+  append-only. Preferir banco descartável para novos experimentos.
 
-### Working tree não commitado
-No `git status --short` observado:
-- modificados: `api/ARCHITECTURE.md`, `api/README.md`, `wager-transaction.ts`, controller e wagering.module;
-- removidos: arquivos antigos `process-bet.errors.ts`, `process-bet.integration.spec.ts`, `process-bet.ts`, `process-bet.types.ts`, `submit-bet.request.ts`;
-- untracked: versões `process-wager.*` e `submit-wager.request.ts`.
-Git pode detectar renames após staging. **Não descartar/resetar essas alterações.** O handoff é a única alteração adicional solicitada nesta etapa.
+## Setup e comandos
 
-Commits existentes observados:
-- `b30b6bb feat(wagering): add bet submission endpoint`
-- `8293a37 fix(wagering): prevent overspending on concurrent bets`
-- `93a7896 feat(wagering): persist bets and ledger entries with PostgreSQL`
-- `4f7276b feat(wagering): add wagering and ledger`
-- `b08d575 feat(wallets): add wallet and money domain models`
-- `f2d9320 feat(api): bootstrap NestJS API with liveness endpoint`
-- `1d4fbfe Initial commit`
+Na raiz: `docker compose up -d db localstack`. O script LocalStack cria
+`wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wager-events.fifo`.
+Na pasta `api`: `bun install`, `bun run db:migrate`, exportar as variáveis
+`SQS_ENDPOINT`, três `SQS_*_QUEUE_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID` e
+`AWS_SECRET_ACCESS_KEY`, então `bun run start:dev`.
 
-### Pendências e limitações conhecidas
-- PENDING_REFERENCE pode ser persistido e replayado como pending; não existe worker para reprocessar após chegada da referência.
-- Compose sobe apenas PostgreSQL; sem fila, SDK, publisher, consumer, inbox/outbox, retry ou DLQ.
-- Endpoint financeiro é síncrono.
-- Integração atual não cobre WIN/LOSS/REFUND/ROLLBACK, erros de referência nem broker.
-- Queries de wallet/ledger, paginação e reconciliação não implementadas.
-- FailureCode.ReferenceNotFound e PermanentInfrastructureFailure existem; revisar uso na recuperação futura.
-- Não confirmado se SQS é requisito do challenge. O conteúdo do anexo original não foi consultado agora.
-- Não foi feita auditoria adicional de SQL/runtime durante a preparação deste documento.
+Scripts existentes: `bun run build`, `bun run lint`, `bun run test`,
+`bun run test:integration`, `bun run test:e2e`, `bun run db:migrate`,
+`bun run db:migrate:down`, `bun run db:migration:create` e
+`bun run db:migration:check`.
 
-## 6. Testes e validações
+## Estado Git ao atualizar este handoff
 
-Scripts em `api/package.json`: `bun run test`, `test:integration`, `test:e2e`, `lint`, `build`; migrations: `db:migrate`, `db:migrate:down`, `db:migration:create`, `db:migration:check`.
-
-Specs presentes: Money, Wallet, WagerTransaction, WalletLedgerEntry; integração em `process-wager.integration.spec.ts` cobre (1) duas apostas concorrentes de R$80 contra R$100; (2) replay idempotente sem débito adicional; (3) conflito com payload diferente na mesma chave. Usa PostgreSQL real, executa migrations e deixa dados de ledger append-only; usar banco descartável/local.
-
-Resultados conhecidos:
-- Build passou após ajuste `as const`.
-- Na reconstrução anterior, agente reportou lint e build aprovados, mas lint não foi reexecutado nesta análise.
-- Não afirmar testes de integração como passantes: não foram executados na última sequência.
-- Nenhum teste comprovou WIN/LOSS/REFUND/ROLLBACK, retry, DLQ ou recuperação de referência.
-- README documenta `docker compose up -d db`, depois `bun install`, `bun run db:migrate`, `bun run start:dev`; defaults DB_HOST localhost, porta 5432, wageringDatabase/user/password.
-
-## 7. Estado atual
-
-**Implementado**: Nest API, liveness, MikroORM/Postgres/migrations, domínios financeiros, endpoint síncrono, BET/WIN/LOSS/REFUND/ROLLBACK no código de aplicação, idempotência, lock wallet, ledger append-only, snapshot de replay. Build passou após fix de tipo.
-
-**Parcial**: pending reference é persistida, mas não retomada; reimplementação de Wager está sem commit e sem testes novos específicos; arquitetura por camadas ainda tem módulos planejados ausentes.
-
-**Não implementado**: integração de fila (SQS ou outro), inbox/outbox, publisher, consumer, workers, retries/backoff/DLQ/recovery; worker pending reference; readiness de DB/broker; queries de wallet/ledger/reconciliação; autenticação conforme escopo a confirmar.
-
-**Quebrado/pendente**: nenhum erro de build conhecido após último fix, mas estado completo não foi testado com integração. Alterações locais devem ser preservadas e revisadas.
-
-## 8. Próximas tarefas (prioridade)
-
-1. Preservar e revisar `git status`/diff atual; não usar reset/checkout destrutivo. Confirmar build ao retomar.
-2. Consultar o enunciado original para confirmar broker, contrato, ACK, ordenação, retry, DLQ e observabilidade. Não assumir SQS obrigatório só por constar no plano.
-3. Desenhar fluxo durável API → banco → broker. Architecture prevê outbox gravada atomicamente com dados financeiros; evitar publicar antes do commit SQL.
-4. Implementar schema/migration de inbox e outbox, se compatível com contrato confirmado; decidir estados, tentativas, leases/locks e publisher.
-5. Implementar consumer e deduplicação da inbox para redelivery; definir ACK somente após resultado durável e retry de falhas transitórias.
-6. Projetar/implementar worker que retoma PENDING_REFERENCE sem violar idempotência ou estados terminais.
-7. Definir falhas permanentes, limites e backoff, DLQ e replay operacional.
-8. Acrescentar testes de integração: tipos/referências, duplicidade/reversões, redelivery, crash windows e concorrência; executar com dependências locais apropriadas.
-9. Atualizar compose, README e ARCHITECTURE com setup real, env vars e operação do broker.
-10. Endpoints de consulta/reconciliação depois, se prazo ou enunciado exigir.
-
-“At-least-once + idempotência” e SQS foram direção/sugestão da conversa, não implementação, e SQS não foi confirmado contra o desafio.
-
-## 9. Convenções e orientações para o próximo agente
-
-### Padrões observados
-- TypeScript ESM; imports locais com extensão `.js`.
-- Arquivos kebab-case; classes/tipos PascalCase.
-- `*.types.ts`, `*.errors.ts`, `*.spec.ts`, `*.integration.spec.ts`.
-- Domínio não importa MikroORM; Entity/EntitySchema ficam em infrastructure.
-- Usar Money para valores financeiros; não converter para number sem justificativa.
-- Controller mapeia erros de aplicação para HTTP.
-- Alterações de schema via migrations revisáveis; preservar garantias de banco.
-- Commits existentes usam prefixos como feat/fix e escopo em parênteses, mas não foi encontrada convenção formal adicional.
-
-### Preferências do usuário
-- Responder em português e explicar mudanças/motivos didaticamente; está aprendendo conceitos do sistema.
-- Seguir documentação, distinguindo plano de código real.
-- Prazo mencionado: três dias; foco nos requisitos principais.
-- Não considera necessária validação ISO-4217.
-- Explicitamente priorizou fila e recuperação em relação a endpoints de consulta.
-- Nenhuma publicação/mensagem externa é necessária ou autorizada por esse pedido.
-
-### Cuidados
-- Ler o challenge antes de fixar broker/retry behavior.
-- Revisar working tree antes de editar; arquivos removidos/untracked fazem parte da refatoração recuperada.
-- Preservar atomicidade do saldo/transação/ledger e idempotência ao introduzir broker.
-- Não prometer exactly-once; distinguir garantias do banco, broker e aplicação.
-- Evitar abstrações genéricas; respeitar direção apresentação → aplicação → domínio/portas → infraestrutura.
-- Relatar exatamente validações executadas; não declarar testes verdes sem execução.
-- Antes de mudar transições, conferir enums, agregado, migrations, snapshots e índices.
-
-## 10. Contexto adicional
-
-- O usuário perguntou sobre Money, crédito/débito, transação, replay, flush, lock e referências; explicações de termos são úteis.
-- Em `resolveReference`, primeiro busca provider + external ID; se não acha, busca só external ID para detectar associação a outro provider. Isso pressupõe que essa busca seja informativa quando IDs externos possam repetir entre provedores. Confirmar contrato antes de alterar.
-- O usuário perguntou “por que não MikroORM?”; projeto usa MikroORM e não há decisão de troca.
-- Testes de integração deixam ledger append-only no banco; evitar banco compartilhado.
-- O usuário tem horizonte curto de três dias; separar requisito obrigatório de melhoria opcional.
+As alterações de AuthGuard e desta atualização documental estão no working tree
+sem commit nesta observação. Não descartar alterações locais sem revisar
+`git status` e `git diff`.

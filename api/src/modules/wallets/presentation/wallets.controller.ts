@@ -8,6 +8,7 @@ import {
   Post,
   Query,
   Body,
+  UseGuards,
 } from '@nestjs/common';
 import {
   InvalidLedgerCursorError,
@@ -16,11 +17,13 @@ import {
   WalletNotFoundError,
 } from '../application/wallet-application.service.js';
 import { parseCreateWalletRequest } from './create-wallet.request.js';
+import { AuthGuard } from '../../identity/auth.guard.js';
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Controller('wallets')
+@UseGuards(AuthGuard)
 export class WalletsController {
   constructor(private readonly wallets: WalletApplicationService) {}
 
