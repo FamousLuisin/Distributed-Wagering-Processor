@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "runId": "cc156f6f-27ec-4b8e-8c30-aa8acf4136ff",
+  "generatedAt": "2026-11-09T04:54:32.984Z",
+  "environment": {
+    "platform": "linux",
+    "architecture": "x64",
+    "cpuCount": 12,
+    "nodeVersion": "26.3.0",
+    "bunVersion": "1.4.4"
+  },
+  "methodology": {
+    "description": "HTTP load against the running API with PostgreSQL and SQS readiness required. Two scenarios use unique BET transactions and real wallets: all requests share one wallet, then requests are distributed round-robin over several wallets.",
+    "requestsPerScenario": 500,
+    "configuredConcurrency": 32,
+    "distributedWalletCount": 10,
+    "amountPerTransaction": "0.01 BRL",
+    "warmupRequests": 0,
+    "setupExcludedFromLatencyAndThroughput": true,
+    "metricsSamplingIntervalMs": 250,
+    "metricsSamplingOverheadIncludedInDuration": true,
+    "outboxDrainTimeoutMs": 90000,
+    "note": "The database and append-only ledger are not cleaned up. Each run creates distinct players, wallets, transactions, ledger entries and outbox events."
+  },
+  "scenarios": [
+    {
+      "name": "single-hot-wallet",
+      "requests": 500,
+      "concurrency": 32,
+      "walletCount": 1,
+      "durationSeconds": 4.31,
+      "throughputAttemptedRps": 116.02,
+      "throughputSuccessfulRps": 116.02,
+      "latencyMs": {
+        "p50": 258.14,
+        "p95": 328.99,
+        "p99": 379.59,
+        "max": 427
+      },
+      "errors": 0,
+      "errorRatePercent": 0,
+      "httpStatuses": {
+        "200": 500
+      },
+      "transactionStatuses": {
+        "PROCESSED": 500
+      },
+      "conflictObservations": {
+        "http409": 0,
+        "databaseLockConflicts": 0,
+        "idempotentDuplicates": 0
+      },
+      "outbox": {
+        "maxObservedLagSeconds": 3.846,
+        "lagAfterDrainSeconds": 0,
+        "pendingAfterDrain": 0,
+        "samples": 33,
+        "sampleErrors": 0,
+        "drainDurationSeconds": 4.248,
+        "drained": true
+      },
+      "reconciledWallets": 1,
+      "reconciliationConsistent": true
+    },
+    {
+      "name": "distributed-wallets",
+      "requests": 500,
+      "concurrency": 32,
+      "walletCount": 10,
+      "durationSeconds": 2.261,
+      "throughputAttemptedRps": 221.17,
+      "throughputSuccessfulRps": 221.17,
+      "latencyMs": {
+        "p50": 143.09,
+        "p95": 166.66,
+        "p99": 176.95,
+        "max": 188.7
+      },
+      "errors": 0,
+      "errorRatePercent": 0,
+      "httpStatuses": {
+        "200": 500
+      },
+      "transactionStatuses": {
+        "PROCESSED": 500
+      },
+      "conflictObservations": {
+        "http409": 0,
+        "databaseLockConflicts": 0,
+        "idempotentDuplicates": 0
+      },
+      "outbox": {
+        "maxObservedLagSeconds": 3.155,
+        "lagAfterDrainSeconds": 0,
+        "pendingAfterDrain": 0,
+        "samples": 26,
+        "sampleErrors": 0,
+        "drainDurationSeconds": 4.833,
+        "drained": true
+      },
+      "reconciledWallets": 10,
+      "reconciliationConsistent": true
+    }
+  ]
+}

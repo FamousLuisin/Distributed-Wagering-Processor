@@ -132,6 +132,35 @@ são simulados dentro do mesmo processo de teste, não como processos de SO
 separados. Como o ledger é append-only, os dados criados permanecem no banco;
 use uma base local descartável para essa validação.
 
+## Teste de carga
+
+Com a API, PostgreSQL e LocalStack em execução e `/health/ready` respondendo
+`200`, rode na pasta `api`:
+
+```bash
+LOAD_API_SQS_ENDPOINT=http://localhost:4566 LOAD_REQUESTS_PER_SCENARIO=500 LOAD_CONCURRENCY=32 LOAD_DISTRIBUTED_WALLETS=10 bun run test:load
+```
+
+O comando faz dois perfis HTTP com operações `BET` reais: todas as requisições
+em uma wallet para expor contenção e a mesma quantidade distribuída entre
+wallets para observar paralelismo independente. Registra throughput tentado e
+bem-sucedido, p50/p95/p99/máximo, taxa de erro, HTTP 409, conflitos PostgreSQL
+reportados pela métrica, duplicatas, pico observado de outbox lag, drenagem da
+outbox e reconciliação. Setup de wallets fica fora da janela de throughput; a
+amostragem de métricas ocorre durante a janela e seu pequeno overhead está
+incluído.
+
+Cada execução cria wallets, apostas, ledger e eventos novos; o ledger não é
+apagado. O relatório JSON é salvo em `load-test-results/` por padrão. Parâmetros
+podem ser alterados com `LOAD_BASE_URL`, `LOAD_REQUESTS_PER_SCENARIO`,
+`LOAD_CONCURRENCY`, `LOAD_DISTRIBUTED_WALLETS`,
+`LOAD_OUTBOX_DRAIN_TIMEOUT_MS`, `LOAD_METRICS_SAMPLE_INTERVAL_MS` e
+`LOAD_REPORT_PATH`; `LOAD_API_SQS_ENDPOINT` registra no resultado o endpoint SQS
+configurado no processo da API. Rode contra uma instância da API sem outro
+tráfego para que as métricas por processo e o outbox lag sejam atribuíveis a
+esta execução. Uma execução medida e sua metodologia estão em
+[`LOAD_TEST.md`](LOAD_TEST.md).
+
 ## Endpoint de aposta
 
 Com a API iniciada e uma wallet existente, envie uma aposta `BET`:
