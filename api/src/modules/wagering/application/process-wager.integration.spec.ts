@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../../../app.module.js';
 import config from '../../../database/mikro-orm.config.js';
 import { WalletLedgerEntryEntity } from '../../ledger/infrastructure/wallet-ledger-entry.entity.js';
@@ -13,6 +13,11 @@ import { WagerTransactionEntity } from '../infrastructure/wager-transaction.enti
 import { WagerTransactionKind } from '../domain/wager-transaction.types.js';
 import { OutboxMessageEntity } from '../../messaging/infrastructure/outbox-message.entity.js';
 import { PendingReferenceWorker } from './pending-reference-worker.js';
+import { Money } from '../../wallets/domain/money.js';
+import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
+import { WalletApplicationService } from '../../wallets/application/wallet-application.service.js';
+
+const walletIdsUnderTest = new Set<string>();
 
 describe('Wagering transactions (PostgreSQL and HTTP)', () => {
   let orm: MikroORM;
@@ -33,24 +38,15 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     await orm?.close(true);
   });
 
+  afterEach(async () => {
+    for (const walletId of walletIdsUnderTest) {
+      await expectWalletBalanceToMatchLedger(orm, walletId);
+    }
+    walletIdsUnderTest.clear();
+  });
+
   it('allows only one of two simultaneous R$ 80 bets against a R$ 100 wallet', async () => {
-    const walletId = randomUUID();
-    const playerId = randomUUID();
-    const now = new Date();
-    const setupEm = orm.em.fork();
-    const wallet = new WalletEntity();
-    Object.assign(wallet, {
-      id: walletId,
-      playerId,
-      currency: 'BRL',
-      balance: '100.00',
-      version: 1,
-      createdAt: now,
-      updatedAt: now,
-    });
-    setupEm.persist(wallet);
-    await setupEm.flush();
-    setupEm.clear();
+    const { walletId, playerId } = await createWallet(orm);
 
     const processWager = new ProcessWager(orm.em);
     const common = {
@@ -90,15 +86,20 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
 
     expect(finalWallet.balance).toBe('20.00');
     expect(finalWallet.version).toBe(2);
-    expect(transactions).toHaveLength(2);
+    const bets = transactions.filter(({ kind }) => kind === 'BET');
+    expect(bets).toHaveLength(2);
     expect(
-      transactions.filter(({ status }) => status === 'PROCESSED'),
+      bets.filter(({ status }) => status === 'PROCESSED'),
     ).toHaveLength(1);
     expect(
-      transactions.filter(({ status }) => status === 'REJECTED'),
+      bets.filter(({ status }) => status === 'REJECTED'),
     ).toHaveLength(1);
-    expect(ledgerEntries).toHaveLength(1);
-    expect(ledgerEntries[0]).toMatchObject({
+    expect(ledgerEntries).toHaveLength(2);
+    const debitEntries = ledgerEntries.filter(
+      ({ direction }) => direction === LedgerDirection.Debit,
+    );
+    expect(debitEntries).toHaveLength(1);
+    expect(debitEntries[0]).toMatchObject({
       direction: 'DEBIT',
       amount: '80.00',
       balanceBefore: '100.00',
@@ -158,8 +159,18 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     const readEm = orm.em.fork();
     const wallet = await readEm.findOneOrFail(WalletEntity, walletId);
     expect(wallet.balance).toBe('65.00');
-    expect(await readEm.count(WagerTransactionEntity, { walletId })).toBe(2);
-    expect(await readEm.count(WalletLedgerEntryEntity, { walletId })).toBe(2);
+    expect(
+      await readEm.count(WagerTransactionEntity, {
+        walletId,
+        idempotencyKey: originalBet.idempotencyKey,
+      }),
+    ).toBe(1);
+    expect(
+      await readEm.count(WalletLedgerEntryEntity, {
+        walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(2);
   });
 
   it('rejects reuse of an idempotency key with a different payload without changing the wallet', async () => {
@@ -186,8 +197,18 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     const readEm = orm.em.fork();
     const wallet = await readEm.findOneOrFail(WalletEntity, walletId);
     expect(wallet.balance).toBe('75.00');
-    expect(await readEm.count(WagerTransactionEntity, { walletId })).toBe(1);
-    expect(await readEm.count(WalletLedgerEntryEntity, { walletId })).toBe(1);
+    expect(
+      await readEm.count(WagerTransactionEntity, {
+        walletId,
+        idempotencyKey: originalBet.idempotencyKey,
+      }),
+    ).toBe(1);
+    expect(
+      await readEm.count(WalletLedgerEntryEntity, {
+        walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
   });
 
   it('retries a missing reference after it arrives and commits financial state and outbox events together', async () => {
@@ -267,7 +288,7 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
         aggregateId: walletId,
         eventType: 'WalletBalanceChanged',
       }),
-    ).toBe(2);
+    ).toBe(3);
   }, 20_000);
 
   it('rejects a reference that remains missing after attempts expire', async () => {
@@ -394,28 +415,228 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
       await extraWorker.onModuleDestroy();
     }
   }, 20_000);
+
+  it('applies one debit when the same wager is submitted 50 times concurrently', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const wager = {
+      providerId: 'fifty-way-race',
+      externalTransactionId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      playerId,
+      walletId,
+      roundId: randomUUID(),
+      gameId: 'fifty-way-race',
+      kind: WagerTransactionKind.Bet as const,
+      money: { amount: '10.00', currency: 'BRL' },
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () =>
+        new ProcessWager(orm.em.fork({ clear: true })).execute(wager),
+      ),
+    );
+
+    expect(results).toHaveLength(50);
+    expect(results.every(({ status }) => status === 'PROCESSED')).toBe(true);
+    expect(results.filter(({ idempotentReplay }) => !idempotentReplay)).toHaveLength(1);
+    expect(new Set(results.map(({ transactionId }) => transactionId)).size).toBe(1);
+
+    const readEm = orm.em.fork({ clear: true });
+    expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe('90.00');
+    expect(
+      await readEm.count(WagerTransactionEntity, {
+        walletId,
+        idempotencyKey: wager.idempotencyKey,
+      }),
+    ).toBe(1);
+    expect(
+      await readEm.count(WalletLedgerEntryEntity, {
+        walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+  }, 40_000);
+
+  it('processes different wallets in parallel without serializing them globally', async () => {
+    const work = await Promise.all(
+      Array.from({ length: 10 }, async () => {
+        const { walletId, playerId } = await createWallet(orm);
+        return {
+          walletId,
+          operation: new ProcessWager(orm.em.fork({ clear: true })).execute({
+            providerId: 'parallel-wallets',
+            externalTransactionId: randomUUID(),
+            idempotencyKey: randomUUID(),
+            playerId,
+            walletId,
+            roundId: randomUUID(),
+            gameId: 'parallel-wallets',
+            kind: WagerTransactionKind.Bet,
+            money: { amount: '10.00', currency: 'BRL' },
+          }),
+        };
+      }),
+    );
+    const results = await Promise.all(work.map(({ operation }) => operation));
+    expect(results.every(({ status }) => status === 'PROCESSED')).toBe(true);
+
+    const readEm = orm.em.fork({ clear: true });
+    for (const { walletId } of work) {
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '90.00',
+      );
+      expect(await readEm.count(WalletLedgerEntryEntity, { walletId })).toBe(2);
+    }
+  }, 30_000);
+
+  it('keeps one financial effect across three independent Nest application instances', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const wager = makeBet({
+      playerId,
+      walletId,
+      idempotencyKey: randomUUID(),
+      externalTransactionId: randomUUID(),
+      amount: '10.00',
+    });
+    const secondApp = await NestFactory.create(AppModule, { logger: false });
+    const thirdApp = await NestFactory.create(AppModule, { logger: false });
+    try {
+      await Promise.all([
+        secondApp.listen(0, '127.0.0.1'),
+        thirdApp.listen(0, '127.0.0.1'),
+      ]);
+      const secondAddress = secondApp.getHttpServer().address() as AddressInfo;
+      const thirdAddress = thirdApp.getHttpServer().address() as AddressInfo;
+      const urls = [
+        baseUrl,
+        `http://127.0.0.1:${secondAddress.port}`,
+        `http://127.0.0.1:${thirdAddress.port}`,
+      ];
+      const responses = await Promise.all(urls.map((url) => postBet(url, wager)));
+      const results = await Promise.all(
+        responses.map((response) => response.json() as Promise<ProcessWagerResult>),
+      );
+
+      expect(responses.map(({ status }) => status)).toEqual([200, 200, 200]);
+      expect(results.filter(({ idempotentReplay }) => !idempotentReplay)).toHaveLength(1);
+      expect(new Set(results.map(({ transactionId }) => transactionId)).size).toBe(1);
+      const readEm = orm.em.fork({ clear: true });
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '90.00',
+      );
+      expect(
+        await readEm.count(WagerTransactionEntity, {
+          walletId,
+          idempotencyKey: wager.idempotencyKey,
+        }),
+      ).toBe(1);
+      expect(
+        await readEm.count(WalletLedgerEntryEntity, {
+          walletId,
+          direction: LedgerDirection.Debit,
+        }),
+      ).toBe(1);
+    } finally {
+      await Promise.all([secondApp.close(), thirdApp.close()]);
+    }
+  }, 40_000);
+
+  it('processes REFUND and ROLLBACK that both arrived before their referenced bet', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const processWager = new ProcessWager(orm.em);
+    const providerId = `out-of-order-reversals-${randomUUID()}`;
+    const roundId = randomUUID();
+    const referencedExternalId = randomUUID();
+    const reversalKinds = [
+      WagerTransactionKind.Refund,
+      WagerTransactionKind.Rollback,
+    ] as const;
+    const reversals = await Promise.all(
+      reversalKinds.map((kind) =>
+        processWager.execute({
+          providerId,
+          externalTransactionId: randomUUID(),
+          idempotencyKey: randomUUID(),
+          playerId,
+          walletId,
+          roundId,
+          gameId: 'out-of-order-reversals',
+          kind,
+          money: { amount: '10.00', currency: 'BRL' },
+          referenceExternalTransactionId: referencedExternalId,
+        }),
+      ),
+    );
+    expect(reversals.map(({ status }) => status)).toEqual([
+      'PENDING_REFERENCE',
+      'PENDING_REFERENCE',
+    ]);
+
+    await processWager.execute({
+      providerId,
+      externalTransactionId: referencedExternalId,
+      idempotencyKey: randomUUID(),
+      playerId,
+      walletId,
+      roundId,
+      gameId: 'out-of-order-reversals',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+
+    const pendingEm = orm.em.fork({ clear: true });
+    const pendingRows = await pendingEm.find(WagerTransactionEntity, {
+      id: { $in: reversals.map(({ transactionId }) => transactionId) },
+    });
+    for (const row of pendingRows) {
+      row.pendingReferenceNextAttemptAt = new Date(Date.now() - 1_000);
+      row.pendingReferenceLeaseToken = null;
+      row.pendingReferenceLeaseUntil = null;
+    }
+    await pendingEm.flush();
+
+    await waitUntil(async () => {
+      const readEm = orm.em.fork({ clear: true });
+      const remaining = await readEm.count(WagerTransactionEntity, {
+        id: { $in: reversals.map(({ transactionId }) => transactionId) },
+        status: 'PENDING_REFERENCE',
+      });
+      return remaining === 0;
+    });
+
+    const readEm = orm.em.fork({ clear: true });
+    const resolved = await readEm.find(WagerTransactionEntity, {
+      id: { $in: reversals.map(({ transactionId }) => transactionId) },
+    });
+    expect(resolved.map(({ status }) => status)).toEqual([
+      'PROCESSED',
+      'PROCESSED',
+    ]);
+    expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+      '110.00',
+    );
+    expect(
+      await readEm.count(WalletLedgerEntryEntity, {
+        walletId,
+        direction: LedgerDirection.Credit,
+      }),
+    ).toBe(3);
+    expect(await readEm.count(WalletLedgerEntryEntity, { walletId })).toBe(4);
+  }, 25_000);
 });
 
 async function createWallet(
   orm: MikroORM,
 ): Promise<{ walletId: string; playerId: string }> {
-  const walletId = randomUUID();
   const playerId = randomUUID();
-  const now = new Date();
-  const em = orm.em.fork();
-  const wallet = new WalletEntity();
-  Object.assign(wallet, {
-    id: walletId,
+  const created = await new WalletApplicationService(
+    orm.em.fork({ clear: true }),
+  ).create({
     playerId,
-    currency: 'BRL',
-    balance: '100.00',
-    version: 1,
-    createdAt: now,
-    updatedAt: now,
+    initialBalance: { amount: '100.00', currency: 'BRL' },
   });
-  em.persist(wallet);
-  await em.flush();
-  return { walletId, playerId };
+  walletIdsUnderTest.add(created.id);
+  return { walletId: created.id, playerId };
 }
 
 function makeBet(props: {
@@ -463,4 +684,39 @@ async function waitUntil(
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('Timed out waiting for pending-reference worker result');
+}
+
+async function expectWalletBalanceToMatchLedger(
+  orm: MikroORM,
+  walletId: string,
+): Promise<void> {
+  const em = orm.em.fork({ clear: true });
+  const wallet = await em.findOneOrFail(WalletEntity, walletId);
+  const entries = await em.find(WalletLedgerEntryEntity, { walletId });
+  let calculated = Money.zero(wallet.currency);
+
+  for (const entry of entries) {
+    const amount = Money.from({ amount: entry.amount, currency: entry.currency });
+    const before = Money.from({
+      amount: entry.balanceBefore,
+      currency: entry.currency,
+    });
+    const after = Money.from({
+      amount: entry.balanceAfter,
+      currency: entry.currency,
+    });
+    if (entry.direction === LedgerDirection.Credit) {
+      expect(after.equals(before.add(amount))).toBe(true);
+      calculated = calculated.add(amount);
+    } else {
+      expect(entry.direction).toBe(LedgerDirection.Debit);
+      expect(after.equals(before.subtract(amount))).toBe(true);
+      calculated = calculated.subtract(amount);
+    }
+  }
+
+  expect(calculated.toJSON()).toEqual({
+    amount: wallet.balance,
+    currency: wallet.currency,
+  });
 }

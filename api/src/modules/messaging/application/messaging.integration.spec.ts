@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
@@ -10,7 +10,7 @@ import {
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../../../app.module.js';
 import config from '../../../database/mikro-orm.config.js';
 import { InboxMessageEntity } from '../infrastructure/inbox-message.entity.js';
@@ -18,6 +18,12 @@ import { OutboxMessageEntity } from '../infrastructure/outbox-message.entity.js'
 import { WalletLedgerEntryEntity } from '../../ledger/infrastructure/wallet-ledger-entry.entity.js';
 import { WagerTransactionEntity } from '../../wagering/infrastructure/wager-transaction.entity.js';
 import { WalletEntity } from '../../wallets/infrastructure/wallet.entity.js';
+import { WalletApplicationService } from '../../wallets/application/wallet-application.service.js';
+import { Money } from '../../wallets/domain/money.js';
+import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
+import { ProcessWager } from '../../wagering/application/process-wager.js';
+import { WagerTransactionKind } from '../../wagering/domain/wager-transaction.types.js';
+import { OutboxPublisher } from './outbox-publisher.js';
 
 const endpoint = 'http://localhost:4566';
 const account = '000000000000';
@@ -25,6 +31,7 @@ const queueUrl = `${endpoint}/${account}/wager-transactions.fifo`;
 const dlqUrl = `${endpoint}/${account}/wager-transactions-dlq.fifo`;
 const eventsUrl = `${endpoint}/${account}/wager-events.fifo`;
 const consumerName = 'wager-transaction-consumer';
+const walletIdsUnderTest = new Set<string>();
 
 describe('Messaging integration (PostgreSQL and LocalStack)', () => {
   let orm: MikroORM;
@@ -58,12 +65,17 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     await orm?.close(true);
   }, 30_000);
 
+  afterEach(async () => {
+    for (const walletId of walletIdsUnderTest) {
+      await expectWalletBalanceToMatchLedger(orm, walletId);
+    }
+    walletIdsUnderTest.clear();
+  });
+
   it('consumes, deduplicates, publishes outbox events, and dead-letters invalid messages', async () => {
-    const walletId = randomUUID();
-    const playerId = randomUUID();
+    const { walletId, playerId } = await createWallet(orm);
     const messageId = randomUUID();
     const externalTransactionId = randomUUID();
-    await createWallet(orm, walletId, playerId);
 
     const envelope = {
       messageId,
@@ -108,7 +120,7 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
         inbox?.processedAt !== undefined &&
         wager?.status === 'PROCESSED' &&
         publishedWagerEvents >= 1 &&
-        publishedWalletEvents >= 1
+        publishedWalletEvents >= 2
       );
     });
     await waitUntil(inputQueueIsDrained);
@@ -128,7 +140,7 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     });
     expect(wallet.balance).toBe('90.00');
     expect(inboxRows).toBe(1);
-    expect(ledgerRows).toBe(1);
+    expect(ledgerRows).toBe(2);
 
     const publishedEventTypes = await receivePublishedEventTypes(wager.id, walletId);
     expect(publishedEventTypes).toContain('WagerTransactionProcessed');
@@ -139,6 +151,214 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     const deadLetter = await waitForDeadLetter(invalidBody);
     expect(deadLetter.MessageAttributes?.failureCode?.StringValue).toBe(
       'InvalidQueueMessageError',
+    );
+  }, 30_000);
+
+  it('retries a transient consumer failure and processes the redelivered message once', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const messageId = randomUUID();
+    const externalTransactionId = randomUUID();
+    const envelope = {
+      messageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'messaging-retry-integration-test',
+        externalTransactionId,
+        idempotencyKey: `retry-test:${externalTransactionId}`,
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'messaging-retry-integration-test',
+        kind: 'BET',
+        money: { amount: '10.00', currency: 'BRL' },
+      },
+    };
+    const body = JSON.stringify(envelope);
+    const processWager = app!.get(ProcessWager);
+    const executeSpy = vi
+      .spyOn(processWager, 'execute')
+      .mockRejectedValueOnce(new Error('temporary database outage'));
+
+    await sendInput(body, walletId, randomUUID());
+    try {
+      await waitUntil(inputQueueIsDrained, 20_000);
+      expect(executeSpy).toHaveBeenCalledTimes(2);
+      const readEm = orm.em.fork({ clear: true });
+      expect(
+        await readEm.count(InboxMessageEntity, {
+          consumerName,
+          messageId,
+        }),
+      ).toBe(1);
+      expect(
+        await readEm.count(WalletLedgerEntryEntity, {
+          walletId,
+          direction: 'DEBIT',
+        }),
+      ).toBe(1);
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '90.00',
+      );
+    } finally {
+      executeSpy.mockRestore();
+    }
+  }, 25_000);
+
+  it('allows concurrent publishers to claim and publish committed outbox events', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const publishers = Array.from({ length: 2 }, () =>
+      new OutboxPublisher(
+        orm.em.fork({ clear: true }),
+        new SQSClient({
+          endpoint,
+          region: 'us-east-1',
+          credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+          maxAttempts: 1,
+        }),
+      ),
+    );
+    publishers.forEach((publisher) => publisher.onApplicationBootstrap());
+    try {
+      const result = await app!.get(ProcessWager).execute({
+        providerId: 'concurrent-publishers-integration-test',
+        externalTransactionId: randomUUID(),
+        idempotencyKey: randomUUID(),
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'concurrent-publishers',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '10.00', currency: 'BRL' },
+      });
+
+      await waitUntil(async () => {
+        const readEm = orm.em.fork({ clear: true });
+        const transactionEvent = await readEm.findOne(OutboxMessageEntity, {
+          aggregateId: result.transactionId,
+          eventType: 'WagerTransactionProcessed',
+        });
+        const balanceEvents = await readEm.find(OutboxMessageEntity, {
+          aggregateId: walletId,
+          eventType: 'WalletBalanceChanged',
+        });
+        const transactionBalanceEvent = balanceEvents.find((message) => {
+          const data = message.payload.data as { transactionId?: string };
+          return data.transactionId === result.transactionId;
+        });
+        return (
+          transactionEvent?.publishedAt !== null &&
+          transactionEvent?.publishedAt !== undefined &&
+          transactionBalanceEvent?.publishedAt !== null &&
+          transactionBalanceEvent?.publishedAt !== undefined
+        );
+      });
+
+      const readEm = orm.em.fork({ clear: true });
+      const transactionEvent = await readEm.findOneOrFail(OutboxMessageEntity, {
+        aggregateId: result.transactionId,
+        eventType: 'WagerTransactionProcessed',
+      });
+      const balanceEvent = (await readEm.find(OutboxMessageEntity, {
+        aggregateId: walletId,
+        eventType: 'WalletBalanceChanged',
+      })).find((message) => {
+        const data = message.payload.data as { transactionId?: string };
+        return data.transactionId === result.transactionId;
+      });
+      expect(transactionEvent.attempts).toBe(0);
+      expect(balanceEvent?.attempts).toBe(0);
+      expect(transactionEvent.leaseToken).toBeNull();
+      expect(balanceEvent?.leaseToken).toBeNull();
+      expect(
+        await receivePublishedEventTypes(result.transactionId, walletId),
+      ).toEqual(expect.arrayContaining([
+        'WagerTransactionProcessed',
+        'WalletBalanceChanged',
+      ]));
+    } finally {
+      await Promise.all(publishers.map((publisher) => publisher.onModuleDestroy()));
+    }
+  }, 30_000);
+
+  it('recovers committed inbox and outbox work after an application restart', async () => {
+    const closingApp = app;
+    app = undefined;
+    await closingApp?.close();
+
+    const { walletId, playerId } = await createWallet(orm);
+    const messageId = randomUUID();
+    const externalTransactionId = randomUUID();
+    const data = {
+      providerId: 'restart-recovery-integration-test',
+      externalTransactionId,
+      idempotencyKey: `restart-test:${externalTransactionId}`,
+      playerId,
+      walletId,
+      roundId: randomUUID(),
+      gameId: 'restart-recovery',
+      kind: WagerTransactionKind.Bet as const,
+      money: { amount: '10.00', currency: 'BRL' },
+    };
+    const envelope = {
+      messageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data,
+    };
+    const body = JSON.stringify(envelope);
+    const payloadHash = createHash('sha256').update(body).digest('hex');
+
+    // Commit the financial work and inbox, then simulate a process death before DeleteMessage.
+    await new ProcessWager(orm.em.fork({ clear: true })).execute({
+      ...data,
+      correlationId: messageId,
+      causationId: messageId,
+      inboxMessage: {
+        messageId,
+        consumerName,
+        payloadHash,
+      },
+    });
+    await sendInput(body, walletId, randomUUID());
+
+    app = await NestFactory.create(AppModule, { logger: false });
+    await app.listen(0, '127.0.0.1');
+    await waitUntil(async () => {
+      if (!(await inputQueueIsDrained())) return false;
+      const readEm = orm.em.fork({ clear: true });
+      const wager = await readEm.findOne(WagerTransactionEntity, {
+        providerId: data.providerId,
+        externalTransactionId,
+      });
+      if (!wager) return false;
+      const unpublished = await readEm.count(OutboxMessageEntity, {
+        $or: [
+          { aggregateId: wager.id, publishedAt: null },
+          { aggregateId: walletId, publishedAt: null },
+        ],
+      });
+      return unpublished === 0;
+    }, 20_000);
+
+    const readEm = orm.em.fork({ clear: true });
+    expect(
+      await readEm.count(InboxMessageEntity, {
+        consumerName,
+        messageId,
+      }),
+    ).toBe(1);
+    expect(
+      await readEm.count(WalletLedgerEntryEntity, {
+        walletId,
+        transactionId: (await readEm.findOneOrFail(WagerTransactionEntity, {
+          providerId: data.providerId,
+          externalTransactionId,
+        })).id,
+      }),
+    ).toBe(1);
+    expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+      '90.00',
     );
   }, 30_000);
 
@@ -279,21 +499,41 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
 
 async function createWallet(
   orm: MikroORM,
-  walletId: string,
-  playerId: string,
-): Promise<void> {
-  const now = new Date();
-  const em = orm.em.fork();
-  const wallet = new WalletEntity();
-  Object.assign(wallet, {
-    id: walletId,
+): Promise<{ walletId: string; playerId: string }> {
+  const playerId = randomUUID();
+  const wallet = await new WalletApplicationService(
+    orm.em.fork({ clear: true }),
+  ).create({
     playerId,
-    currency: 'BRL',
-    balance: '100.00',
-    version: 1,
-    createdAt: now,
-    updatedAt: now,
+    initialBalance: { amount: '100.00', currency: 'BRL' },
   });
-  em.persist(wallet);
-  await em.flush();
+  walletIdsUnderTest.add(wallet.id);
+  return { walletId: wallet.id, playerId };
+}
+
+async function expectWalletBalanceToMatchLedger(
+  orm: MikroORM,
+  walletId: string,
+): Promise<void> {
+  const em = orm.em.fork({ clear: true });
+  const wallet = await em.findOneOrFail(WalletEntity, walletId);
+  const entries = await em.find(WalletLedgerEntryEntity, { walletId });
+  let calculated = Money.zero(wallet.currency);
+  for (const entry of entries) {
+    const amount = Money.from({ amount: entry.amount, currency: entry.currency });
+    const before = Money.from({ amount: entry.balanceBefore, currency: entry.currency });
+    const after = Money.from({ amount: entry.balanceAfter, currency: entry.currency });
+    if (entry.direction === LedgerDirection.Credit) {
+      expect(after.equals(before.add(amount))).toBe(true);
+      calculated = calculated.add(amount);
+    } else {
+      expect(entry.direction).toBe(LedgerDirection.Debit);
+      expect(after.equals(before.subtract(amount))).toBe(true);
+      calculated = calculated.subtract(amount);
+    }
+  }
+  expect(calculated.toJSON()).toEqual({
+    amount: wallet.balance,
+    currency: wallet.currency,
+  });
 }

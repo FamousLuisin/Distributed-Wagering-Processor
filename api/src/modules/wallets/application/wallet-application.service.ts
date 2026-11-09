@@ -80,6 +80,9 @@ export class WalletApplicationService {
       await this.em.transactional(async (em) => {
         const walletEntity = this.toWalletEntity(wallet);
         em.persist(walletEntity);
+        // EntitySchema does not model the wager-to-wallet relation, so flush
+        // the FK target first while remaining inside this SQL transaction.
+        await em.flush();
 
         if (initialBalance.isPositive()) {
           const transaction = WagerTransactionAggregate.createOpening({
@@ -142,8 +145,6 @@ export class WalletApplicationService {
               this.toOutboxEntity(OutboxMessage.enqueue(event, now)),
             ),
           );
-          await em.flush();
-        } else {
           await em.flush();
         }
       });
