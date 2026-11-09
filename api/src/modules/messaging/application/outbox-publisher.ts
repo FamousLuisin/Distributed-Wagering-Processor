@@ -5,19 +5,15 @@ import {
   OnApplicationBootstrap,
   OnModuleDestroy,
 } from '@nestjs/common';
-import {
-  LockMode,
-  QueryOrder,
-} from '@mikro-orm/core';
+import { LockMode, QueryOrder } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
-import {
-  SendMessageCommand,
-  SQSClient,
-} from '@aws-sdk/client-sqs';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { randomUUID } from 'node:crypto';
 import { OutboxMessage } from '../domain/outbox-message.js';
 import { OutboxMessageEntity } from '../infrastructure/outbox-message.entity.js';
 import { SQS_CLIENT } from '../infrastructure/sqs-client.provider.js';
+import { MetricsService } from '../../../shared/observability/metrics.service.js';
+import { logEvent } from '../../../shared/observability/structured-log.js';
 
 interface ClaimedOutboxMessage {
   id: string;
@@ -32,7 +28,9 @@ interface ClaimedOutboxMessage {
 }
 
 @Injectable()
-export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy {
+export class OutboxPublisher
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
   private static readonly BATCH_SIZE = 10;
   private static readonly LEASE_DURATION_MS = 60_000;
   private static readonly POLL_INTERVAL_MS = 1_000;
@@ -44,6 +42,7 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
   constructor(
     private readonly em: EntityManager,
     @Inject(SQS_CLIENT) private readonly sqs: SQSClient,
+    private readonly metrics: MetricsService = new MetricsService(),
   ) {
     if (this.queueUrl && !this.queueUrl.endsWith('.fifo')) {
       throw new Error('SQS_EVENTS_QUEUE_URL must point to a FIFO queue');
@@ -52,11 +51,14 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
 
   onApplicationBootstrap(): void {
     if (!this.queueUrl) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'outbox_publisher_disabled',
-          reason: 'SQS_EVENTS_QUEUE_URL is not configured',
-        }),
+      logEvent(
+        this.logger,
+        'warn',
+        OutboxPublisher.name,
+        'outbox_publisher_disabled',
+        {
+          errorCode: 'SQS_EVENTS_QUEUE_URL_NOT_CONFIGURED',
+        },
       );
       return;
     }
@@ -72,6 +74,7 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
   private async runLoop(): Promise<void> {
     while (!this.stopping) {
       try {
+        await this.refreshOutboxMetrics();
         const messages = await this.claimBatch();
         if (messages.length > 0) {
           await Promise.allSettled(
@@ -80,11 +83,14 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
           continue;
         }
       } catch (error) {
-        this.logger.error(
-          JSON.stringify({
-            event: 'outbox_poll_failed',
-            error: this.errorName(error),
-          }),
+        logEvent(
+          this.logger,
+          'error',
+          OutboxPublisher.name,
+          'outbox_poll_failed',
+          {
+            errorCode: this.errorName(error),
+          },
         );
       }
       await new Promise((resolve) =>
@@ -138,6 +144,7 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
   private async publishOne(message: ClaimedOutboxMessage): Promise<void> {
     const queueUrl = this.queueUrl;
     if (!queueUrl) return;
+    const startedAt = Date.now();
     try {
       await this.sqs.send(
         new SendMessageCommand({
@@ -168,30 +175,62 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
         },
       );
       if (updated === 0) {
-        this.logger.warn(
-          JSON.stringify({ event: 'outbox_publish_lease_lost', eventId: message.id }),
+        logEvent(
+          this.logger,
+          'warn',
+          OutboxPublisher.name,
+          'outbox_publish_lease_lost',
+          {
+            ...this.eventLogContext(message),
+            messageId: message.id,
+            eventId: message.id,
+            eventType: message.eventType,
+          },
         );
         return;
       }
-      this.logger.log(
-        JSON.stringify({
-          event: 'outbox_event_published',
+      this.metrics.increment(
+        'outbox_events_published_total',
+        'Events successfully published from the transactional outbox.',
+        { event_type: message.eventType },
+      );
+      logEvent(
+        this.logger,
+        'log',
+        OutboxPublisher.name,
+        'outbox_event_published',
+        {
+          ...this.eventLogContext(message),
+          messageId: message.id,
           eventId: message.id,
           eventType: message.eventType,
-        }),
+          durationMs: Date.now() - startedAt,
+        },
       );
     } catch (error) {
       try {
         await this.scheduleRetry(message, error);
       } catch (retryError) {
-        this.logger.error(
-          JSON.stringify({
-            event: 'outbox_retry_persist_failed',
+        logEvent(
+          this.logger,
+          'error',
+          OutboxPublisher.name,
+          'outbox_retry_persist_failed',
+          {
+            ...this.eventLogContext(message),
+            messageId: message.id,
             eventId: message.id,
-            error: this.errorName(retryError),
-          }),
+            errorCode: this.errorName(retryError),
+          },
         );
       }
+    } finally {
+      this.metrics.observe(
+        'outbox_publish_duration_seconds',
+        'Time spent publishing a committed outbox event to SQS.',
+        (Date.now() - startedAt) / 1_000,
+        { event_type: message.eventType },
+      );
     }
   }
 
@@ -212,6 +251,11 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
     });
     const errorCode = this.errorName(error);
     domainMessage.scheduleRetry(now, errorCode);
+    this.metrics.increment(
+      'messaging_retries_total',
+      'Retry attempts scheduled by asynchronous messaging components.',
+      { component: 'outbox_publisher' },
+    );
 
     const em = this.em.fork({ clear: true });
     const updated = await em.nativeUpdate(
@@ -229,15 +273,67 @@ export class OutboxPublisher implements OnApplicationBootstrap, OnModuleDestroy 
         lastError: errorCode,
       },
     );
-    this.logger.warn(
-      JSON.stringify({
-        event: updated > 0 ? 'outbox_retry_scheduled' : 'outbox_retry_lease_lost',
+    logEvent(
+      this.logger,
+      'warn',
+      OutboxPublisher.name,
+      updated > 0 ? 'outbox_retry_scheduled' : 'outbox_retry_lease_lost',
+      {
+        ...this.eventLogContext(message),
+        messageId: message.id,
         eventId: message.id,
         attempt: domainMessage.attempts,
         nextAttemptAt: domainMessage.nextAttemptAt.toISOString(),
-        error: errorCode,
-      }),
+        errorCode,
+      },
     );
+  }
+
+  private async refreshOutboxMetrics(): Promise<void> {
+    const em = this.em.fork({ clear: true });
+    const pending = await em.find(
+      OutboxMessageEntity,
+      { publishedAt: null },
+      {
+        orderBy: { createdAt: QueryOrder.ASC },
+        limit: 1,
+        fields: ['createdAt'],
+      },
+    );
+    const pendingCount = await em.count(OutboxMessageEntity, {
+      publishedAt: null,
+    });
+    const oldestCreatedAt = pending[0]?.createdAt.getTime();
+    this.metrics.setGauge(
+      'outbox_pending_messages',
+      'Number of outbox events not yet marked as published.',
+      pendingCount,
+    );
+    this.metrics.setGauge(
+      'outbox_oldest_unpublished_seconds',
+      'Age of the oldest unpublished outbox event in seconds.',
+      oldestCreatedAt === undefined
+        ? 0
+        : Math.max(0, (Date.now() - oldestCreatedAt) / 1_000),
+    );
+  }
+
+  private eventLogContext(message: ClaimedOutboxMessage) {
+    const data = message.payload.data;
+    const fields =
+      typeof data === 'object' && data !== null
+        ? (data as Record<string, unknown>)
+        : {};
+    const asString = (value: unknown) =>
+      typeof value === 'string' ? value : undefined;
+    return {
+      correlationId: asString(fields.correlationId),
+      causationId: asString(fields.causationId),
+      transactionId: asString(fields.transactionId),
+      walletId: asString(fields.walletId),
+      providerId: asString(fields.providerId),
+      externalTransactionId: asString(fields.externalTransactionId),
+    };
   }
 
   private errorName(error: unknown): string {

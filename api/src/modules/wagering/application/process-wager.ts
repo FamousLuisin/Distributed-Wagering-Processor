@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
@@ -46,6 +46,8 @@ import {
   pendingReferenceRetryDelay,
   PENDING_REFERENCE_POLICY,
 } from './pending-reference-policy.js';
+import { MetricsService } from '../../../shared/observability/metrics.service.js';
+import { logEvent } from '../../../shared/observability/structured-log.js';
 
 type ReferenceResolution =
   | { type: 'none' }
@@ -54,14 +56,16 @@ type ReferenceResolution =
   | { type: 'valid'; entity: WagerTransactionEntity };
 
 export type PendingReferenceRetryResult =
-  | 'stale'
-  | 'rescheduled'
-  | 'processed'
-  | 'rejected';
+  'stale' | 'rescheduled' | 'processed' | 'rejected';
 
 @Injectable()
 export class ProcessWager {
-  constructor(private readonly em: EntityManager) {}
+  private readonly logger = new Logger(ProcessWager.name);
+
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: MetricsService = new MetricsService(),
+  ) {}
 
   async retryPendingReference(
     transactionId: string,
@@ -69,20 +73,22 @@ export class ProcessWager {
   ): Promise<PendingReferenceRetryResult> {
     const em = this.em.fork({ clear: true });
     return em.transactional(async (em) => {
-      const candidate = await em.findOne(WagerTransactionEntity, {
-        id: transactionId,
-        status: WagerTransactionStatus.PendingReference,
-      }, { refresh: true });
+      const candidate = await em.findOne(
+        WagerTransactionEntity,
+        {
+          id: transactionId,
+          status: WagerTransactionStatus.PendingReference,
+        },
+        { refresh: true },
+      );
       if (!candidate || candidate.pendingReferenceLeaseToken !== leaseToken) {
         return 'stale';
       }
 
       // Keep the same lock order as new wager processing: wallet, then wager.
-      const walletEntity = await em.findOne(
-        WalletEntity,
-        candidate.walletId,
-        { lockMode: LockMode.PESSIMISTIC_WRITE },
-      );
+      const walletEntity = await em.findOne(WalletEntity, candidate.walletId, {
+        lockMode: LockMode.PESSIMISTIC_WRITE,
+      });
       if (!walletEntity) throw new WalletNotFoundError(candidate.walletId);
 
       const wagerEntity = await em.findOne(
@@ -248,7 +254,9 @@ export class ProcessWager {
         if (!wager.failureCode) {
           throw new Error('Rejected wager is missing its failure code');
         }
-        events.push(WagerTransactionRejected.from(eventContext, wager.failureCode));
+        events.push(
+          WagerTransactionRejected.from(eventContext, wager.failureCode),
+        );
       }
 
       if (ledgerEntity) {
@@ -309,6 +317,88 @@ export class ProcessWager {
   }
 
   async execute(props: ProcessWagerProps): Promise<ProcessWagerResult> {
+    const startedAt = Date.now();
+    let status = 'error';
+    const correlatedProps = {
+      ...props,
+      correlationId: props.correlationId ?? randomUUID(),
+    };
+    try {
+      const result = await this.executeWithRecovery(correlatedProps);
+      status = result.status;
+      this.metrics.increment(
+        'wagering_transactions_total',
+        'Wagering transaction outcomes, including idempotent replays.',
+        { status: result.status, kind: props.kind },
+      );
+      if (result.idempotentReplay) {
+        this.metrics.increment(
+          'wagering_duplicates_total',
+          'Requests served from the persisted idempotency result.',
+          { source: 'idempotency_replay' },
+        );
+      }
+      logEvent(
+        this.logger,
+        'log',
+        ProcessWager.name,
+        'wager_processing_completed',
+        {
+          correlationId: correlatedProps.correlationId,
+          causationId: correlatedProps.causationId,
+          messageId: correlatedProps.inboxMessage?.messageId,
+          transactionId: result.transactionId,
+          walletId: props.walletId,
+          providerId: props.providerId,
+          externalTransactionId: props.externalTransactionId,
+          status: result.status,
+          errorCode: result.failureCode,
+          durationMs: Date.now() - startedAt,
+          kind: props.kind,
+          idempotentReplay: result.idempotentReplay,
+        },
+      );
+      return result;
+    } catch (error) {
+      const sqlState = this.sqlState(error);
+      if (sqlState && ['40P01', '55P03', '40001'].includes(sqlState)) {
+        this.metrics.increment(
+          'database_lock_conflicts_total',
+          'Database deadlock, lock timeout, or serialization conflicts.',
+          { sqlstate: sqlState },
+        );
+      }
+      logEvent(
+        this.logger,
+        'error',
+        ProcessWager.name,
+        'wager_processing_failed',
+        {
+          correlationId: correlatedProps.correlationId,
+          causationId: correlatedProps.causationId,
+          messageId: correlatedProps.inboxMessage?.messageId,
+          walletId: props.walletId,
+          providerId: props.providerId,
+          externalTransactionId: props.externalTransactionId,
+          errorCode: this.errorName(error),
+          durationMs: Date.now() - startedAt,
+          kind: props.kind,
+        },
+      );
+      throw error;
+    } finally {
+      this.metrics.observe(
+        'wager_processing_duration_seconds',
+        'Time spent processing a wagering request.',
+        (Date.now() - startedAt) / 1_000,
+        { kind: props.kind, status },
+      );
+    }
+  }
+
+  private async executeWithRecovery(
+    props: ProcessWagerProps,
+  ): Promise<ProcessWagerResult> {
     const money = Money.from(props.money);
     if (!money.isPositive()) throw new InvalidWagerAmountError();
     const payloadHash = ProcessWager.hashPayload(props, money);
@@ -326,6 +416,24 @@ export class ProcessWager {
       if (!(error instanceof UniqueConstraintViolationException)) throw error;
       return this.recoverUniqueConflict(props, payloadHash, error);
     }
+  }
+
+  private sqlState(error: unknown): string | undefined {
+    let current: unknown = error;
+    for (let depth = 0; depth < 3; depth += 1) {
+      if (typeof current !== 'object' || current === null) return undefined;
+      if ('code' in current) {
+        const code = (current as { code?: unknown }).code;
+        if (typeof code === 'string') return code;
+      }
+      current =
+        'cause' in current ? (current as { cause?: unknown }).cause : undefined;
+    }
+    return undefined;
+  }
+
+  private errorName(error: unknown): string {
+    return error instanceof Error ? error.name : 'UnknownError';
   }
 
   private async processInsideTransaction(
@@ -671,8 +779,8 @@ export class ProcessWager {
       createdAt: entity.createdAt,
       status: entity.status as WagerTransactionStatus,
       referenceTransactionId: entity.referenceTransactionId ?? undefined,
-      failureCode: (entity.failureCode as FailureCode | null | undefined) ??
-        undefined,
+      failureCode:
+        (entity.failureCode as FailureCode | null | undefined) ?? undefined,
       processedAt: entity.processedAt,
     });
   }
@@ -828,7 +936,9 @@ export class ProcessWager {
       processedAt: wager.processedAt,
       pendingReferenceAttempts: 0,
       pendingReferenceNextAttemptAt: pendingReference
-        ? new Date(wager.createdAt.getTime() + PENDING_REFERENCE_POLICY.baseDelayMs)
+        ? new Date(
+            wager.createdAt.getTime() + PENDING_REFERENCE_POLICY.baseDelayMs,
+          )
         : null,
       pendingReferenceExpiresAt: pendingReference
         ? new Date(wager.createdAt.getTime() + PENDING_REFERENCE_POLICY.ttlMs)

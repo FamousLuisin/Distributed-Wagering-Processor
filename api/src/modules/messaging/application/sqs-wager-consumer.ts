@@ -3,6 +3,7 @@ import type { Message } from '@aws-sdk/client-sqs';
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -17,9 +18,7 @@ import {
 import { HttpException } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { InboxMessageEntity } from '../infrastructure/inbox-message.entity.js';
-import {
-  SQS_CONSUMER_CLIENT,
-} from '../infrastructure/sqs-client.provider.js';
+import { SQS_CONSUMER_CLIENT } from '../infrastructure/sqs-client.provider.js';
 import { ProcessWager } from '../../wagering/application/process-wager.js';
 import {
   ExternalTransactionConflictError,
@@ -33,6 +32,8 @@ import {
 } from '../../wagering/application/process-wager.errors.js';
 import { parseSubmitWagerRequest } from '../../wagering/presentation/submit-wager.request.js';
 import type { ProcessWagerProps } from '../../wagering/application/process-wager.types.js';
+import { MetricsService } from '../../../shared/observability/metrics.service.js';
+import { logEvent } from '../../../shared/observability/structured-log.js';
 
 interface DecodedWagerMessage {
   props: ProcessWagerProps;
@@ -47,7 +48,9 @@ class InvalidQueueMessageError extends Error {
 }
 
 @Injectable()
-export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy {
+export class SqsWagerConsumer
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
   private static readonly CONSUMER_NAME = 'wager-transaction-consumer';
   private static readonly VISIBILITY_TIMEOUT_SECONDS = 60;
   private static readonly VISIBILITY_HEARTBEAT_MS = 30_000;
@@ -57,27 +60,34 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
     process.env.SQS_TRANSACTIONS_DLQ_QUEUE_URL?.trim();
   private stopping = false;
   private loopPromise?: Promise<void>;
+  private lastDlqMetricsAt = 0;
 
   constructor(
     private readonly em: EntityManager,
     private readonly processWager: ProcessWager,
     @Inject(SQS_CONSUMER_CLIENT) private readonly sqs: SQSClient,
+    private readonly metrics: MetricsService = new MetricsService(),
   ) {
     if (this.queueUrl && !this.queueUrl.endsWith('.fifo')) {
       throw new Error('SQS_TRANSACTIONS_QUEUE_URL must point to a FIFO queue');
     }
     if (this.deadLetterQueueUrl && !this.deadLetterQueueUrl.endsWith('.fifo')) {
-      throw new Error('SQS_TRANSACTIONS_DLQ_QUEUE_URL must point to a FIFO queue');
+      throw new Error(
+        'SQS_TRANSACTIONS_DLQ_QUEUE_URL must point to a FIFO queue',
+      );
     }
   }
 
   onApplicationBootstrap(): void {
     if (!this.queueUrl) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'wager_consumer_disabled',
-          reason: 'SQS_TRANSACTIONS_QUEUE_URL is not configured',
-        }),
+      logEvent(
+        this.logger,
+        'warn',
+        SqsWagerConsumer.name,
+        'wager_consumer_disabled',
+        {
+          errorCode: 'SQS_TRANSACTIONS_QUEUE_URL_NOT_CONFIGURED',
+        },
       );
       return;
     }
@@ -101,17 +111,24 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
             MaxNumberOfMessages: 1,
             WaitTimeSeconds: 20,
             VisibilityTimeout: SqsWagerConsumer.VISIBILITY_TIMEOUT_SECONDS,
-            MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
+            MessageSystemAttributeNames: [
+              'ApproximateReceiveCount',
+              'MessageGroupId',
+            ],
           }),
         );
+        await this.refreshDlqMetrics();
         const message = response.Messages?.[0];
         if (message) await this.handleMessage(message);
       } catch (error) {
-        this.logger.error(
-          JSON.stringify({
-            event: 'wager_consumer_poll_failed',
-            error: this.errorName(error),
-          }),
+        logEvent(
+          this.logger,
+          'error',
+          SqsWagerConsumer.name,
+          'wager_consumer_poll_failed',
+          {
+            errorCode: this.errorName(error),
+          },
         );
         await this.delay(1_000);
       }
@@ -119,12 +136,18 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
   }
 
   private async handleMessage(message: Message): Promise<void> {
+    const startedAt = Date.now();
+    let outcome = 'failed';
     if (!message.ReceiptHandle || message.Body === undefined) {
-      this.logger.error(
-        JSON.stringify({
-          event: 'wager_message_missing_receipt_or_body',
+      logEvent(
+        this.logger,
+        'error',
+        SqsWagerConsumer.name,
+        'wager_message_missing_receipt_or_body',
+        {
+          errorCode: 'SQS_MESSAGE_MISSING_RECEIPT_OR_BODY',
           sqsMessageId: message.MessageId,
-        }),
+        },
       );
       return;
     }
@@ -134,33 +157,49 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
     try {
       decoded = this.decodeMessage(message.Body, payloadHash);
     } catch (error) {
-      await this.sendPermanentMessageToDlq(message, this.errorName(error));
+      outcome = await this.sendPermanentMessageToDlq(
+        message,
+        this.errorName(error),
+      );
+      this.metrics.observe(
+        'sqs_consumer_processing_duration_seconds',
+        'Time spent handling an SQS wager message.',
+        (Date.now() - startedAt) / 1_000,
+        { outcome },
+      );
       return;
     }
 
     const heartbeat = setInterval(() => {
       void this.extendVisibility(message).catch((error: unknown) => {
-        this.logger.warn(
-          JSON.stringify({
-            event: 'wager_message_visibility_extension_failed',
+        logEvent(
+          this.logger,
+          'warn',
+          SqsWagerConsumer.name,
+          'wager_message_visibility_extension_failed',
+          {
+            correlationId: decoded.props.correlationId,
+            causationId: decoded.props.causationId,
+            walletId: decoded.props.walletId,
+            providerId: decoded.props.providerId,
+            externalTransactionId: decoded.props.externalTransactionId,
+            errorCode: this.errorName(error),
             messageId: decoded.inbox.messageId,
-            error: this.errorName(error),
-          }),
+          },
         );
       });
     }, SqsWagerConsumer.VISIBILITY_HEARTBEAT_MS);
 
     try {
-      const previous = await this.em.fork({ clear: true }).findOne(
-        InboxMessageEntity,
-        {
+      const previous = await this.em
+        .fork({ clear: true })
+        .findOne(InboxMessageEntity, {
           consumerName: decoded.inbox.consumerName,
           messageId: decoded.inbox.messageId,
-        },
-      );
+        });
       if (previous) {
         if (previous.payloadHash !== decoded.inbox.payloadHash) {
-          await this.sendPermanentMessageToDlq(
+          outcome = await this.sendPermanentMessageToDlq(
             message,
             'INBOX_MESSAGE_ID_PAYLOAD_CONFLICT',
           );
@@ -168,11 +207,25 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
         }
         if (previous.processedAt) {
           await this.acknowledge(message);
-          this.logger.log(
-            JSON.stringify({
-              event: 'wager_message_duplicate_acknowledged',
+          outcome = 'duplicate';
+          this.metrics.increment(
+            'wagering_duplicates_total',
+            'Duplicate requests acknowledged from the durable inbox.',
+            { source: 'inbox' },
+          );
+          logEvent(
+            this.logger,
+            'log',
+            SqsWagerConsumer.name,
+            'wager_message_duplicate_acknowledged',
+            {
+              correlationId: decoded.props.correlationId,
+              causationId: decoded.props.causationId,
+              walletId: decoded.props.walletId,
+              providerId: decoded.props.providerId,
+              externalTransactionId: decoded.props.externalTransactionId,
               messageId: decoded.inbox.messageId,
-            }),
+            },
           );
           return;
         }
@@ -181,45 +234,75 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
       try {
         const result = await this.processWager.execute(decoded.props);
         await this.acknowledge(message);
-        this.logger.log(
-          JSON.stringify({
-            event: 'wager_message_processed',
-            messageId: decoded.inbox.messageId,
+        outcome = result.status.toLowerCase();
+        logEvent(
+          this.logger,
+          'log',
+          SqsWagerConsumer.name,
+          'wager_message_processed',
+          {
+            correlationId: decoded.props.correlationId,
+            causationId: decoded.props.causationId,
             transactionId: result.transactionId,
+            walletId: decoded.props.walletId,
+            providerId: decoded.props.providerId,
+            externalTransactionId: decoded.props.externalTransactionId,
             status: result.status,
-          }),
+            messageId: decoded.inbox.messageId,
+            idempotentReplay: result.idempotentReplay,
+          },
         );
       } catch (error) {
         if (this.isTerminalBusinessError(error)) {
           await this.processWager.recordTerminalInboxMessage(decoded.inbox);
           await this.acknowledge(message);
-          this.logger.warn(
-            JSON.stringify({
-              event: 'wager_message_terminal_business_error',
+          outcome = 'terminal_business_error';
+          logEvent(
+            this.logger,
+            'warn',
+            SqsWagerConsumer.name,
+            'wager_message_terminal_business_error',
+            {
+              correlationId: decoded.props.correlationId,
+              causationId: decoded.props.causationId,
+              walletId: decoded.props.walletId,
+              providerId: decoded.props.providerId,
+              externalTransactionId: decoded.props.externalTransactionId,
+              errorCode: this.errorName(error),
               messageId: decoded.inbox.messageId,
-              error: this.errorName(error),
-            }),
+            },
           );
           return;
         }
         if (error instanceof InboxMessagePayloadConflictError) {
-          await this.sendPermanentMessageToDlq(message, error.name);
+          outcome = await this.sendPermanentMessageToDlq(message, error.name);
           return;
         }
         if (error instanceof InboxMessageWithoutWagerError) {
-          await this.sendPermanentMessageToDlq(message, error.name);
+          outcome = await this.sendPermanentMessageToDlq(message, error.name);
           return;
         }
+        outcome = 'retry';
         await this.retryLater(message, error);
       }
     } catch (error) {
+      outcome = 'retry';
       await this.retryLater(message, error);
     } finally {
       clearInterval(heartbeat);
+      this.metrics.observe(
+        'sqs_consumer_processing_duration_seconds',
+        'Time spent handling an SQS wager message.',
+        (Date.now() - startedAt) / 1_000,
+        { outcome },
+      );
     }
   }
 
-  private decodeMessage(body: string, payloadHash: string): DecodedWagerMessage {
+  private decodeMessage(
+    body: string,
+    payloadHash: string,
+  ): DecodedWagerMessage {
     let value: unknown;
     try {
       value = JSON.parse(body) as unknown;
@@ -234,7 +317,9 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
       value.messageId.trim().length === 0 ||
       value.messageId.length > 128
     ) {
-      throw new InvalidQueueMessageError('messageId must be a non-empty string up to 128 characters');
+      throw new InvalidQueueMessageError(
+        'messageId must be a non-empty string up to 128 characters',
+      );
     }
     if (value.type !== 'WagerTransactionRequested') {
       throw new InvalidQueueMessageError('Unsupported message type');
@@ -243,7 +328,9 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
       typeof value.occurredAt !== 'string' ||
       Number.isNaN(Date.parse(value.occurredAt))
     ) {
-      throw new InvalidQueueMessageError('occurredAt must be a valid timestamp');
+      throw new InvalidQueueMessageError(
+        'occurredAt must be a valid timestamp',
+      );
     }
 
     const data = value.data;
@@ -255,7 +342,9 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
       props = parseSubmitWagerRequest(data, this.asString(idempotencyKey));
     } catch (error) {
       if (error instanceof HttpException) {
-        throw new InvalidQueueMessageError('Message data does not match the wager contract');
+        throw new InvalidQueueMessageError(
+          'Message data does not match the wager contract',
+        );
       }
       throw error;
     }
@@ -302,6 +391,39 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
     );
   }
 
+  private async refreshDlqMetrics(): Promise<void> {
+    if (!this.deadLetterQueueUrl || Date.now() - this.lastDlqMetricsAt < 30_000)
+      return;
+    this.lastDlqMetricsAt = Date.now();
+    try {
+      const response = await this.sqs.send(
+        new GetQueueAttributesCommand({
+          QueueUrl: this.deadLetterQueueUrl,
+          AttributeNames: ['ApproximateNumberOfMessages'],
+        }),
+      );
+      const visible = Number.parseInt(
+        response.Attributes?.ApproximateNumberOfMessages ?? '0',
+        10,
+      );
+      this.metrics.setGauge(
+        'sqs_dlq_visible_messages',
+        'Approximate number of visible messages in the wagering dead-letter queue.',
+        Number.isFinite(visible) ? visible : 0,
+      );
+    } catch (error) {
+      logEvent(
+        this.logger,
+        'warn',
+        SqsWagerConsumer.name,
+        'sqs_dlq_metrics_refresh_failed',
+        {
+          errorCode: this.errorName(error),
+        },
+      );
+    }
+  }
+
   private async retryLater(message: Message, error: unknown): Promise<void> {
     if (!this.queueUrl || !message.ReceiptHandle) return;
     const receiveCount = Number.parseInt(
@@ -309,6 +431,11 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
       10,
     );
     const delaySeconds = Math.min(2 ** Math.max(receiveCount - 1, 0), 60);
+    this.metrics.increment(
+      'messaging_retries_total',
+      'Retry attempts scheduled by asynchronous messaging components.',
+      { component: 'sqs_consumer' },
+    );
     try {
       await this.sqs.send(
         new ChangeMessageVisibilityCommand({
@@ -318,33 +445,41 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
         }),
       );
     } catch (visibilityError) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'wager_message_retry_visibility_failed',
+      logEvent(
+        this.logger,
+        'warn',
+        SqsWagerConsumer.name,
+        'wager_message_retry_visibility_failed',
+        {
+          errorCode: this.errorName(visibilityError),
           sqsMessageId: message.MessageId,
-          error: this.errorName(visibilityError),
-        }),
+        },
       );
     }
-    this.logger.error(
-      JSON.stringify({
-        event: 'wager_message_retry_scheduled',
+    logEvent(
+      this.logger,
+      'warn',
+      SqsWagerConsumer.name,
+      'wager_message_retry_scheduled',
+      {
+        errorCode: this.errorName(error),
+        messageId: message.MessageId,
         sqsMessageId: message.MessageId,
         receiveCount,
         delaySeconds,
-        error: this.errorName(error),
-      }),
+      },
     );
   }
 
   private async sendPermanentMessageToDlq(
     message: Message,
     failureCode: string,
-  ): Promise<void> {
-    if (!this.queueUrl || !message.ReceiptHandle || message.Body === undefined) return;
+  ): Promise<'dead_letter' | 'retry'> {
+    if (!this.queueUrl || !message.ReceiptHandle || message.Body === undefined)
+      return 'retry';
     if (!this.deadLetterQueueUrl) {
       await this.retryLater(message, new Error(failureCode));
-      return;
+      return 'retry';
     }
     try {
       await this.sqs.send(
@@ -358,20 +493,33 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, OnModuleDestroy
             message.MessageId ??
             createHash('sha256').update(message.Body).digest('hex'),
           MessageAttributes: {
-            failureCode: { DataType: 'String', StringValue: failureCode.slice(0, 128) },
+            failureCode: {
+              DataType: 'String',
+              StringValue: failureCode.slice(0, 128),
+            },
           },
         }),
       );
       await this.acknowledge(message);
-      this.logger.warn(
-        JSON.stringify({
-          event: 'wager_message_sent_to_dlq',
-          sqsMessageId: message.MessageId,
-          failureCode,
-        }),
+      this.metrics.increment(
+        'sqs_dead_letter_messages_total',
+        'Messages successfully transferred to the configured dead-letter queue.',
+        { component: 'sqs_consumer' },
       );
+      logEvent(
+        this.logger,
+        'warn',
+        SqsWagerConsumer.name,
+        'wager_message_sent_to_dlq',
+        {
+          errorCode: failureCode,
+          sqsMessageId: message.MessageId,
+        },
+      );
+      return 'dead_letter';
     } catch (error) {
       await this.retryLater(message, error);
+      return 'retry';
     }
   }
 

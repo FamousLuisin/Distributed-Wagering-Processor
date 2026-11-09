@@ -18,6 +18,6 @@ import { PendingReferenceWorker } from '../wagering/application/pending-referenc
     SqsWagerConsumer,
     PendingReferenceWorker,
   ],
-  exports: [OutboxPublisher],
+  exports: [OutboxPublisher, SQS_CLIENT],
 })
 export class MessagingModule {}

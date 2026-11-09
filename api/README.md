@@ -55,6 +55,27 @@ Durante o processamento, a visibilidade é renovada a cada 30 segundos. No
 SIGTERM, a aplicação para de buscar mensagens e espera o processamento em curso
 terminar antes de fechar o cliente SQS.
 
+## Health checks e observabilidade
+
+`GET /health/live` verifica se o processo HTTP está ativo. `GET /health/ready`
+retorna HTTP 200 somente quando PostgreSQL responde a `SELECT 1` e as filas FIFO
+de transações, DLQ e eventos estão acessíveis; falhas retornam HTTP 503 com o
+resultado individual dos probes. As URLs das três filas precisam estar
+configuradas para a API ser considerada pronta.
+
+`GET /health/metrics` expõe métricas Prometheus por processo, incluindo os
+resultados das apostas, replays idempotentes e duplicatas da inbox, retries por
+componente, mensagens enviadas à DLQ e atualmente visíveis na DLQ, conflitos
+PostgreSQL de deadlock/lock/serialização, quantidade e idade da outbox pendente,
+além da duração do processamento financeiro, consumo SQS e publicação da
+outbox. Um scraper deve coletar cada instância; os contadores em memória zeram
+quando o processo reinicia.
+
+Os logs de processamento financeiro, consumer, publisher, worker de referências
+e reconciliação são JSON estruturado. Compartilham timestamp, nível, componente,
+evento, correlation/causation IDs, transação, wallet, provedor, ID externo,
+status, código de erro e duração; campos sem valor são emitidos como `null`.
+
 O `PendingReferenceWorker` também inicia com a API e verifica o PostgreSQL a
 cada segundo. Pendências recebem primeira tentativa após 1 segundo, expiram em
 15 minutos e têm até 8 tentativas, com backoff exponencial limitado a 60

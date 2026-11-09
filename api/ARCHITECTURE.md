@@ -60,8 +60,8 @@ documentada.
 - `wagering`: idempotência e regras de BET/WIN/LOSS/REFUND/ROLLBACK.
 - `ledger`: lançamentos imutáveis, leitura auditável e reconciliação.
 - `messaging`: inbox, outbox, integração SQS e recuperação de mensagens.
-- `health`: liveness e readiness; readiness será conectada ao PostgreSQL e ao
-  SQS quando esses adaptadores forem configurados.
+- `health`: liveness, readiness do PostgreSQL/SQS e endpoint Prometheus de
+  métricas operacionais.
 - `database`: configuração do MikroORM e migrations versionadas/reversíveis.
 - `shared`: não deve virar uma pasta genérica; tipos permanecem no módulo dono
   até existir uma necessidade real de compartilhamento.

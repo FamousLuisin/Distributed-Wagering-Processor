@@ -8,10 +8,7 @@ import { OutboxMessageEntity } from '../../messaging/infrastructure/outbox-messa
 import { WalletLedgerEntry } from '../../ledger/domain/wallet-ledger-entry.js';
 import { WalletLedgerEntryEntity } from '../../ledger/infrastructure/wallet-ledger-entry.entity.js';
 import { WagerTransaction as WagerTransactionAggregate } from '../../wagering/domain/wager-transaction.js';
-import {
-  WagerTransactionKind,
-  WagerTransactionStatus,
-} from '../../wagering/domain/wager-transaction.types.js';
+import { WagerTransactionKind } from '../../wagering/domain/wager-transaction.types.js';
 import {
   WalletBalanceChanged,
   WagerTransactionProcessed,
@@ -21,6 +18,8 @@ import { Money } from '../domain/money.js';
 import type { MoneyProps } from '../domain/money.props.js';
 import { Wallet } from '../domain/wallet.js';
 import { WalletEntity } from '../infrastructure/wallet.entity.js';
+import { logEvent } from '../../../shared/observability/structured-log.js';
+import { MetricsService } from '../../../shared/observability/metrics.service.js';
 
 export interface CreateWalletProps {
   playerId: string;
@@ -62,7 +61,10 @@ export class InvalidLedgerCursorError extends Error {
 export class WalletApplicationService {
   private readonly logger = new Logger(WalletApplicationService.name);
 
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: MetricsService = new MetricsService(),
+  ) {}
 
   async create(props: CreateWalletProps) {
     const initialBalance = Money.from(props.initialBalance);
@@ -91,7 +93,9 @@ export class WalletApplicationService {
             externalTransactionId: `opening:${wallet.id}`,
             idempotencyKey: `opening:${wallet.id}`,
             payloadHash: createHash('sha256')
-              .update(`opening|${wallet.id}|${initialBalance.toJSON().amount}|${initialBalance.currency}`)
+              .update(
+                `opening|${wallet.id}|${initialBalance.toJSON().amount}|${initialBalance.currency}`,
+              )
               .digest('hex'),
             walletId: wallet.id,
             playerId: wallet.playerId,
@@ -150,7 +154,10 @@ export class WalletApplicationService {
       });
     } catch (error) {
       if (error instanceof UniqueConstraintViolationException) {
-        throw new WalletAlreadyExistsError(props.playerId, initialBalance.currency);
+        throw new WalletAlreadyExistsError(
+          props.playerId,
+          initialBalance.currency,
+        );
       }
       throw error;
     }
@@ -164,10 +171,9 @@ export class WalletApplicationService {
   }
 
   async get(walletId: string) {
-    const entity = await this.em.fork({ clear: true }).findOne(
-      WalletEntity,
-      walletId,
-    );
+    const entity = await this.em
+      .fork({ clear: true })
+      .findOne(WalletEntity, walletId);
     if (!entity) throw new WalletNotFoundError(walletId);
     return this.toWalletResponse(entity);
   }
@@ -192,9 +198,9 @@ export class WalletApplicationService {
       limit: page.limit + 1,
     });
     const hasMore = entries.length > page.limit;
-    const items = entries.slice(0, page.limit).map((entry) =>
-      this.toLedgerResponse(entry),
-    );
+    const items = entries
+      .slice(0, page.limit)
+      .map((entry) => this.toLedgerResponse(entry));
     const last = items.at(-1);
 
     return {
@@ -232,7 +238,10 @@ export class WalletApplicationService {
           ledgerEntriesConsistent = false;
           continue;
         }
-        const amount = Money.from({ amount: entry.amount, currency: entry.currency });
+        const amount = Money.from({
+          amount: entry.amount,
+          currency: entry.currency,
+        });
         const balanceBefore = Money.from({
           amount: entry.balanceBefore,
           currency: entry.currency,
@@ -266,13 +275,21 @@ export class WalletApplicationService {
       const difference = storedBalance.subtract(calculatedBalance);
       const consistent = ledgerEntriesConsistent && difference.isZero();
       if (!consistent) {
-        this.logger.warn(
-          JSON.stringify({
-            event: 'wallet_reconciliation_mismatch',
+        this.metrics.increment(
+          'wallet_reconciliation_mismatches_total',
+          'Wallet reconciliations where the stored balance and ledger disagree.',
+        );
+        logEvent(
+          this.logger,
+          'warn',
+          WalletApplicationService.name,
+          'wallet_reconciliation_mismatch',
+          {
             walletId,
+            errorCode: 'LEDGER_BALANCE_MISMATCH',
             checkedEntries: entries.length,
             ledgerEntriesConsistent,
-          }),
+          },
         );
       }
 
@@ -395,11 +412,16 @@ export class WalletApplicationService {
         typeof parsed.createdAt !== 'string' ||
         Number.isNaN(Date.parse(parsed.createdAt)) ||
         typeof parsed.id !== 'string' ||
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.id)
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          parsed.id,
+        )
       ) {
         throw new Error('Invalid cursor fields');
       }
-      return { createdAt: new Date(parsed.createdAt).toISOString(), id: parsed.id };
+      return {
+        createdAt: new Date(parsed.createdAt).toISOString(),
+        id: parsed.id,
+      };
     } catch {
       throw new InvalidLedgerCursorError();
     }

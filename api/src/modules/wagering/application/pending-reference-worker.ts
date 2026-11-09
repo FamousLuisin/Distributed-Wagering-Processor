@@ -11,6 +11,8 @@ import { WagerTransactionStatus } from '../domain/wager-transaction.types.js';
 import { WagerTransactionEntity } from '../infrastructure/wager-transaction.entity.js';
 import { ProcessWager } from './process-wager.js';
 import { PENDING_REFERENCE_POLICY } from './pending-reference-policy.js';
+import { MetricsService } from '../../../shared/observability/metrics.service.js';
+import { logEvent } from '../../../shared/observability/structured-log.js';
 
 @Injectable()
 export class PendingReferenceWorker
@@ -23,6 +25,7 @@ export class PendingReferenceWorker
   constructor(
     private readonly em: EntityManager,
     private readonly processWager: ProcessWager,
+    private readonly metrics: MetricsService = new MetricsService(),
   ) {}
 
   onApplicationBootstrap(): void {
@@ -44,29 +47,80 @@ export class PendingReferenceWorker
               item.transactionId,
               item.leaseToken,
             );
-            this.logger.debug(
-              `Pending reference ${item.transactionId}: ${result}`,
+            this.metrics.increment(
+              'pending_reference_attempts_total',
+              'Pending-reference worker results by outcome.',
+              { outcome: result },
+            );
+            if (result === 'rescheduled') {
+              this.metrics.increment(
+                'messaging_retries_total',
+                'Retry attempts scheduled by asynchronous processing components.',
+                { component: 'pending_reference_worker' },
+              );
+            }
+            if (result === 'processed' || result === 'rejected') {
+              this.metrics.increment(
+                'wagering_transactions_total',
+                'Wagering transaction status transitions, including reference recovery.',
+                { status: result.toUpperCase(), kind: item.kind },
+              );
+            }
+            logEvent(
+              this.logger,
+              'debug',
+              PendingReferenceWorker.name,
+              'pending_reference_attempt_completed',
+              {
+                transactionId: item.transactionId,
+                walletId: item.walletId,
+                providerId: item.providerId,
+                externalTransactionId: item.externalTransactionId,
+                status: result,
+              },
             );
           } catch (error) {
-            this.logger.error(
-              `Failed to retry pending reference ${item.transactionId}`,
-              error instanceof Error ? error.stack : String(error),
+            logEvent(
+              this.logger,
+              'error',
+              PendingReferenceWorker.name,
+              'pending_reference_attempt_failed',
+              {
+                transactionId: item.transactionId,
+                walletId: item.walletId,
+                providerId: item.providerId,
+                externalTransactionId: item.externalTransactionId,
+                errorCode: error instanceof Error ? error.name : 'UnknownError',
+              },
             );
           }
         }
       } catch (error) {
-        this.logger.error(
-          'Pending-reference polling failed',
-          error instanceof Error ? error.stack : String(error),
+        logEvent(
+          this.logger,
+          'error',
+          PendingReferenceWorker.name,
+          'pending_reference_poll_failed',
+          {
+            errorCode: error instanceof Error ? error.name : 'UnknownError',
+          },
         );
       }
 
-      if (!this.stopping) await this.delay(PENDING_REFERENCE_POLICY.pollIntervalMs);
+      if (!this.stopping)
+        await this.delay(PENDING_REFERENCE_POLICY.pollIntervalMs);
     }
   }
 
   private async claimDueBatch(): Promise<
-    Array<{ transactionId: string; leaseToken: string }>
+    Array<{
+      transactionId: string;
+      walletId: string;
+      providerId: string;
+      externalTransactionId: string;
+      kind: string;
+      leaseToken: string;
+    }>
   > {
     const em = this.em.fork({ clear: true });
     return em.transactional(async (em) => {
@@ -104,7 +158,14 @@ export class PendingReferenceWorker
         row.pendingReferenceLeaseUntil = new Date(
           now.getTime() + PENDING_REFERENCE_POLICY.leaseMs,
         );
-        return { transactionId: row.id, leaseToken };
+        return {
+          transactionId: row.id,
+          walletId: row.walletId,
+          providerId: row.providerId,
+          externalTransactionId: row.externalTransactionId,
+          kind: row.kind,
+          leaseToken,
+        };
       });
       if (claimed.length > 0) await em.flush();
       return claimed;
