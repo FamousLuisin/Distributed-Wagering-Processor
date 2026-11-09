@@ -233,6 +233,13 @@ payload e direção contábil. A validação de ownership da referência, rodada
 valor, duplicidade de reversão e saldo cabe ao caso de uso que tem acesso aos
 repositórios e à wallet.
 
+Embora o agregado e o schema aceitem `FAILED`, o fluxo atual não persiste esse
+estado. Falhas técnicas abortam a transação para que a mensagem possa ser
+reentregue; erros permanentes de contrato vão para a DLQ, sem criar uma wager
+financeira. Uma política para falhas permanentes de infraestrutura que devam
+ser auditadas como `FAILED` ainda precisa ser definida antes de conectar esse
+estado ao fluxo.
+
 `WalletLedgerEntry` é imutável. A factory exige valor positivo, moeda igual em
 valor e saldos, saldo final não negativo e aritmética consistente: débito subtrai
 o valor e crédito soma. `LOSS` não gera lançamento. `ROLLBACK` inverte a direção
@@ -260,10 +267,11 @@ valor ficam `null`; payload financeiro completo não é registrado.
 
 ## Limitações de validação
 
-Os testes de três instâncias Nest e restart rodam dentro de um mesmo processo de
-teste; não são três processos do sistema operacional nem encerramento forçado.
-Os testes cobrem concorrência de publishers e retry transitório do consumer,
-mas não injetam falha temporária no publisher até validar seu backoff, nem
-aguardam uma falha técnica chegar à DLQ pela redrive policy de cinco entregas.
-O registry de métricas é efêmero e publisher não tem DLQ própria nem limite de
-retries; eventos permanentemente problemáticos podem acumular na outbox.
+Há um cenário separado com três processos Bun independentes e 50 submits
+idempotentes simultâneos. O restart e a falha após commit antes do ACK ainda são
+simulados por reinicialização da aplicação e redelivery, sem matar um processo
+do sistema operacional exatamente nessa janela. Os testes de integração também
+injetam uma falha transitória no publisher e verificam o redrive do consumer
+após cinco entregas. O registry de métricas é efêmero e publisher não tem DLQ
+própria nem limite de retries; eventos permanentemente problemáticos podem
+acumular na outbox.

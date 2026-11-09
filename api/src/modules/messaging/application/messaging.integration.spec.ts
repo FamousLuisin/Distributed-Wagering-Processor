@@ -10,7 +10,15 @@ import {
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import { AppModule } from '../../../app.module.js';
 import config from '../../../database/mikro-orm.config.js';
 import { InboxMessageEntity } from '../infrastructure/inbox-message.entity.js';
@@ -24,6 +32,8 @@ import { LedgerDirection } from '../../../shared/domain/ledger-direction.js';
 import { ProcessWager } from '../../wagering/application/process-wager.js';
 import { WagerTransactionKind } from '../../wagering/domain/wager-transaction.types.js';
 import { OutboxPublisher } from './outbox-publisher.js';
+import { SQS_CLIENT } from '../infrastructure/sqs-client.provider.js';
+import { SqsWagerConsumer } from './sqs-wager-consumer.js';
 
 const endpoint = 'http://localhost:4566';
 const account = '000000000000';
@@ -142,7 +152,10 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     expect(inboxRows).toBe(1);
     expect(ledgerRows).toBe(2);
 
-    const publishedEventTypes = await receivePublishedEventTypes(wager.id, walletId);
+    const publishedEventTypes = await receivePublishedEventTypes(
+      wager.id,
+      walletId,
+    );
     expect(publishedEventTypes).toContain('WagerTransactionProcessed');
     expect(publishedEventTypes).toContain('WalletBalanceChanged');
 
@@ -205,18 +218,127 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     }
   }, 25_000);
 
+  it('retries a transient outbox publish failure and eventually marks the event published', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    await waitUntil(async () => {
+      const readEm = orm.em.fork({ clear: true });
+      return (
+        (await readEm.count(OutboxMessageEntity, { publishedAt: null })) === 0
+      );
+    }, 20_000);
+
+    const publisherClient = app!.get<SQSClient>(SQS_CLIENT);
+    const sendSpy = vi
+      .spyOn(publisherClient, 'send')
+      .mockRejectedValueOnce(new Error('injected transient SQS failure'));
+    try {
+      const result = await app!.get(ProcessWager).execute({
+        providerId: 'outbox-retry-integration-test',
+        externalTransactionId: randomUUID(),
+        idempotencyKey: randomUUID(),
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'outbox-retry',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '10.00', currency: 'BRL' },
+      });
+
+      await waitUntil(async () => {
+        const readEm = orm.em.fork({ clear: true });
+        const transactionEvent = await readEm.findOne(OutboxMessageEntity, {
+          aggregateId: result.transactionId,
+          eventType: 'WagerTransactionProcessed',
+        });
+        const balanceEvents = await readEm.find(OutboxMessageEntity, {
+          aggregateId: walletId,
+          eventType: 'WalletBalanceChanged',
+        });
+        const balanceEvent = balanceEvents.find((event) => {
+          const data = event.payload.data as { transactionId?: string };
+          return data.transactionId === result.transactionId;
+        });
+        const events = [transactionEvent, balanceEvent];
+        return events.some(
+          (event) => event?.attempts === 1 && event.publishedAt !== null,
+        );
+      }, 20_000);
+
+      expect(sendSpy).toHaveBeenCalled();
+      const readEm = orm.em.fork({ clear: true });
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '90.00',
+      );
+      expect(
+        await readEm.count(WalletLedgerEntryEntity, {
+          walletId,
+          direction: LedgerDirection.Debit,
+        }),
+      ).toBe(1);
+    } finally {
+      sendSpy.mockRestore();
+    }
+  }, 45_000);
+
+  it('moves a repeatedly failing message to the configured redrive DLQ after five deliveries', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const messageId = randomUUID();
+    const externalTransactionId = randomUUID();
+    const body = JSON.stringify({
+      messageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'consumer-redrive-integration-test',
+        externalTransactionId,
+        idempotencyKey: `redrive-test:${externalTransactionId}`,
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'consumer-redrive',
+        kind: 'BET',
+        money: { amount: '10.00', currency: 'BRL' },
+      },
+    });
+    const executeSpy = vi
+      .spyOn(app!.get(ProcessWager), 'execute')
+      .mockRejectedValue(new Error('injected persistent database failure'));
+
+    try {
+      await sendInput(body, walletId, randomUUID());
+      const deadLetter = await waitForDeadLetter(body, 55_000);
+      expect(deadLetter.Body).toBe(body);
+      expect(executeSpy).toHaveBeenCalledTimes(5);
+      expect(await inputQueueIsDrained()).toBe(true);
+      const readEm = orm.em.fork({ clear: true });
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '100.00',
+      );
+      expect(
+        await readEm.count(WagerTransactionEntity, {
+          providerId: 'consumer-redrive-integration-test',
+          externalTransactionId,
+        }),
+      ).toBe(0);
+    } finally {
+      executeSpy.mockRestore();
+    }
+  }, 65_000);
+
   it('allows concurrent publishers to claim and publish committed outbox events', async () => {
     const { walletId, playerId } = await createWallet(orm);
-    const publishers = Array.from({ length: 2 }, () =>
-      new OutboxPublisher(
-        orm.em.fork({ clear: true }),
-        new SQSClient({
-          endpoint,
-          region: 'us-east-1',
-          credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-          maxAttempts: 1,
-        }),
-      ),
+    const publishers = Array.from(
+      { length: 2 },
+      () =>
+        new OutboxPublisher(
+          orm.em.fork({ clear: true }),
+          new SQSClient({
+            endpoint,
+            region: 'us-east-1',
+            credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+            maxAttempts: 1,
+          }),
+        ),
     );
     publishers.forEach((publisher) => publisher.onApplicationBootstrap());
     try {
@@ -259,10 +381,12 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
         aggregateId: result.transactionId,
         eventType: 'WagerTransactionProcessed',
       });
-      const balanceEvent = (await readEm.find(OutboxMessageEntity, {
-        aggregateId: walletId,
-        eventType: 'WalletBalanceChanged',
-      })).find((message) => {
+      const balanceEvent = (
+        await readEm.find(OutboxMessageEntity, {
+          aggregateId: walletId,
+          eventType: 'WalletBalanceChanged',
+        })
+      ).find((message) => {
         const data = message.payload.data as { transactionId?: string };
         return data.transactionId === result.transactionId;
       });
@@ -272,12 +396,16 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
       expect(balanceEvent?.leaseToken).toBeNull();
       expect(
         await receivePublishedEventTypes(result.transactionId, walletId),
-      ).toEqual(expect.arrayContaining([
-        'WagerTransactionProcessed',
-        'WalletBalanceChanged',
-      ]));
+      ).toEqual(
+        expect.arrayContaining([
+          'WagerTransactionProcessed',
+          'WalletBalanceChanged',
+        ]),
+      );
     } finally {
-      await Promise.all(publishers.map((publisher) => publisher.onModuleDestroy()));
+      await Promise.all(
+        publishers.map((publisher) => publisher.onModuleDestroy()),
+      );
     }
   }, 30_000);
 
@@ -351,10 +479,12 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     expect(
       await readEm.count(WalletLedgerEntryEntity, {
         walletId,
-        transactionId: (await readEm.findOneOrFail(WagerTransactionEntity, {
-          providerId: data.providerId,
-          externalTransactionId,
-        })).id,
+        transactionId: (
+          await readEm.findOneOrFail(WagerTransactionEntity, {
+            providerId: data.providerId,
+            externalTransactionId,
+          })
+        ).id,
       }),
     ).toBe(1);
     expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
@@ -370,7 +500,11 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     expect(Date.now() - startedAt).toBeLessThan(25_000);
   }, 30_000);
 
-  async function sendInput(body: string, groupId: string, deduplicationId: string) {
+  async function sendInput(
+    body: string,
+    groupId: string,
+    deduplicationId: string,
+  ) {
     await sqs.send(
       new SendMessageCommand({
         QueueUrl: queueUrl,
@@ -385,7 +519,10 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     const response = await sqs.send(
       new GetQueueAttributesCommand({
         QueueUrl: queueUrl,
-        AttributeNames: ['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'],
+        AttributeNames: [
+          'ApproximateNumberOfMessages',
+          'ApproximateNumberOfMessagesNotVisible',
+        ],
       }),
     );
     return (
@@ -402,7 +539,8 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     const deadline = Date.now() + 10_000;
     while (
       Date.now() < deadline &&
-      (!found.has('WagerTransactionProcessed') || !found.has('WalletBalanceChanged'))
+      (!found.has('WagerTransactionProcessed') ||
+        !found.has('WalletBalanceChanged'))
     ) {
       const response = await sqs.send(
         new ReceiveMessageCommand({
@@ -447,8 +585,8 @@ describe('Messaging integration (PostgreSQL and LocalStack)', () => {
     return [...found];
   }
 
-  async function waitForDeadLetter(body: string) {
-    const deadline = Date.now() + 10_000;
+  async function waitForDeadLetter(body: string, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const response = await sqs.send(
         new ReceiveMessageCommand({
@@ -520,9 +658,18 @@ async function expectWalletBalanceToMatchLedger(
   const entries = await em.find(WalletLedgerEntryEntity, { walletId });
   let calculated = Money.zero(wallet.currency);
   for (const entry of entries) {
-    const amount = Money.from({ amount: entry.amount, currency: entry.currency });
-    const before = Money.from({ amount: entry.balanceBefore, currency: entry.currency });
-    const after = Money.from({ amount: entry.balanceAfter, currency: entry.currency });
+    const amount = Money.from({
+      amount: entry.amount,
+      currency: entry.currency,
+    });
+    const before = Money.from({
+      amount: entry.balanceBefore,
+      currency: entry.currency,
+    });
+    const after = Money.from({
+      amount: entry.balanceAfter,
+      currency: entry.currency,
+    });
     if (entry.direction === LedgerDirection.Credit) {
       expect(after.equals(before.add(amount))).toBe(true);
       calculated = calculated.add(amount);

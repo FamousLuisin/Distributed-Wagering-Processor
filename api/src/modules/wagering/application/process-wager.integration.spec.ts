@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { spawn, type ChildProcess } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
@@ -88,12 +89,8 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
     expect(finalWallet.version).toBe(2);
     const bets = transactions.filter(({ kind }) => kind === 'BET');
     expect(bets).toHaveLength(2);
-    expect(
-      bets.filter(({ status }) => status === 'PROCESSED'),
-    ).toHaveLength(1);
-    expect(
-      bets.filter(({ status }) => status === 'REJECTED'),
-    ).toHaveLength(1);
+    expect(bets.filter(({ status }) => status === 'PROCESSED')).toHaveLength(1);
+    expect(bets.filter(({ status }) => status === 'REJECTED')).toHaveLength(1);
     expect(ledgerEntries).toHaveLength(2);
     const debitEntries = ledgerEntries.filter(
       ({ direction }) => direction === LedgerDirection.Debit,
@@ -368,10 +365,9 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
         referenceExternalTransactionId,
       });
       const pendingEm = orm.em.fork({ clear: true });
-      const pendingRow = await pendingEm.findOneOrFail(
-        WagerTransactionEntity,
-        { id: pending.transactionId },
-      );
+      const pendingRow = await pendingEm.findOneOrFail(WagerTransactionEntity, {
+        id: pending.transactionId,
+      });
       await processWager.execute({
         providerId,
         externalTransactionId: referenceExternalTransactionId,
@@ -408,9 +404,9 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
           eventType: 'WagerTransactionProcessed',
         }),
       ).toBe(1);
-      expect((await verifyEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
-        '105.00',
-      );
+      expect(
+        (await verifyEm.findOneOrFail(WalletEntity, walletId)).balance,
+      ).toBe('105.00');
     } finally {
       await extraWorker.onModuleDestroy();
     }
@@ -438,11 +434,17 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
 
     expect(results).toHaveLength(50);
     expect(results.every(({ status }) => status === 'PROCESSED')).toBe(true);
-    expect(results.filter(({ idempotentReplay }) => !idempotentReplay)).toHaveLength(1);
-    expect(new Set(results.map(({ transactionId }) => transactionId)).size).toBe(1);
+    expect(
+      results.filter(({ idempotentReplay }) => !idempotentReplay),
+    ).toHaveLength(1);
+    expect(
+      new Set(results.map(({ transactionId }) => transactionId)).size,
+    ).toBe(1);
 
     const readEm = orm.em.fork({ clear: true });
-    expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe('90.00');
+    expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+      '90.00',
+    );
     expect(
       await readEm.count(WagerTransactionEntity, {
         walletId,
@@ -512,14 +514,22 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
         `http://127.0.0.1:${secondAddress.port}`,
         `http://127.0.0.1:${thirdAddress.port}`,
       ];
-      const responses = await Promise.all(urls.map((url) => postBet(url, wager)));
+      const responses = await Promise.all(
+        urls.map((url) => postBet(url, wager)),
+      );
       const results = await Promise.all(
-        responses.map((response) => response.json() as Promise<ProcessWagerResult>),
+        responses.map(
+          (response) => response.json() as Promise<ProcessWagerResult>,
+        ),
       );
 
       expect(responses.map(({ status }) => status)).toEqual([200, 200, 200]);
-      expect(results.filter(({ idempotentReplay }) => !idempotentReplay)).toHaveLength(1);
-      expect(new Set(results.map(({ transactionId }) => transactionId)).size).toBe(1);
+      expect(
+        results.filter(({ idempotentReplay }) => !idempotentReplay),
+      ).toHaveLength(1);
+      expect(
+        new Set(results.map(({ transactionId }) => transactionId)).size,
+      ).toBe(1);
       const readEm = orm.em.fork({ clear: true });
       expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
         '90.00',
@@ -540,6 +550,69 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
       await Promise.all([secondApp.close(), thirdApp.close()]);
     }
   }, 40_000);
+
+  it('deduplicates 50 concurrent submissions across three operating-system processes', async () => {
+    const { walletId, playerId } = await createWallet(orm);
+    const wager = makeBet({
+      playerId,
+      walletId,
+      idempotencyKey: randomUUID(),
+      externalTransactionId: randomUUID(),
+      amount: '10.00',
+    });
+    const instances: Array<{ baseUrl: string; child: ChildProcess }> = [];
+
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        instances.push(await startHttpProcessInstance());
+      }
+      const results = await Promise.all(
+        Array.from({ length: 50 }, (_, index) =>
+          postBet(instances[index % instances.length]!.baseUrl, wager),
+        ),
+      );
+      const bodies = await Promise.all(
+        results.map(
+          (response) => response.json() as Promise<ProcessWagerResult>,
+        ),
+      );
+
+      expect(results.map(({ status }) => status)).toEqual(
+        Array.from({ length: 50 }, () => 200),
+      );
+      expect(
+        bodies.filter(({ idempotentReplay }) => !idempotentReplay),
+      ).toHaveLength(1);
+      expect(
+        new Set(bodies.map(({ transactionId }) => transactionId)).size,
+      ).toBe(1);
+
+      const readEm = orm.em.fork({ clear: true });
+      expect((await readEm.findOneOrFail(WalletEntity, walletId)).balance).toBe(
+        '90.00',
+      );
+      expect(
+        await readEm.count(WagerTransactionEntity, {
+          walletId,
+          idempotencyKey: wager.idempotencyKey,
+        }),
+      ).toBe(1);
+      expect(
+        await readEm.count(WalletLedgerEntryEntity, {
+          walletId,
+          direction: LedgerDirection.Debit,
+        }),
+      ).toBe(1);
+      expect(
+        await readEm.count(OutboxMessageEntity, {
+          aggregateId: bodies[0]!.transactionId,
+          eventType: 'WagerTransactionProcessed',
+        }),
+      ).toBe(1);
+    } finally {
+      await Promise.all(instances.map(({ child }) => stopHttpProcess(child)));
+    }
+  }, 60_000);
 
   it('processes REFUND and ROLLBACK that both arrived before their referenced bet', async () => {
     const { walletId, playerId } = await createWallet(orm);
@@ -625,6 +698,81 @@ describe('Wagering transactions (PostgreSQL and HTTP)', () => {
   }, 25_000);
 });
 
+async function startHttpProcessInstance(): Promise<{
+  baseUrl: string;
+  child: ChildProcess;
+}> {
+  const child = spawn('bun', ['run', 'src/testing/http-instance.ts'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: '0',
+      SQS_ENDPOINT: '',
+      SQS_TRANSACTIONS_QUEUE_URL: '',
+      SQS_TRANSACTIONS_DLQ_QUEUE_URL: '',
+      SQS_EVENTS_QUEUE_URL: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(`Timed out starting child API process: ${stderr}`));
+    }, 20_000);
+
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
+      stdout += chunk;
+      const ready = /INSTANCE_READY (http:\/\/127\.0\.0\.1:\d+)/.exec(stdout);
+      if (!ready || settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ baseUrl: ready[1]!, child });
+    });
+    child.stderr?.on('data', (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-4_000);
+    });
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(
+        new Error(
+          `Child API process exited before readiness (code=${code}, signal=${signal}): ${stderr}`,
+        ),
+      );
+    });
+  });
+}
+
+async function stopHttpProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGTERM');
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve();
+    }, 10_000);
+    child.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
 async function createWallet(
   orm: MikroORM,
 ): Promise<{ walletId: string; playerId: string }> {
@@ -696,7 +844,10 @@ async function expectWalletBalanceToMatchLedger(
   let calculated = Money.zero(wallet.currency);
 
   for (const entry of entries) {
-    const amount = Money.from({ amount: entry.amount, currency: entry.currency });
+    const amount = Money.from({
+      amount: entry.amount,
+      currency: entry.currency,
+    });
     const before = Money.from({
       amount: entry.balanceBefore,
       currency: entry.currency,

@@ -144,16 +144,18 @@ Existem testes unitários dos domínios e integrações com PostgreSQL/LocalStac
 Os cenários de integração cobrem duas apostas concorrentes, replay e conflito
 idempotente, recuperação/rejeição de referência, lease abandonado, 50 submits
 iguais concorrentes, wallets distintas, três aplicações Nest independentes,
+três processos Bun separados recebendo 50 submits idempotentes concorrentes,
 REFUND/ROLLBACK antes da referência, inbox/DLQ, retry transitório do consumer,
-publishers concorrentes, restart simulado e shutdown. Depois de cada cenário,
-saldo é comparado com ledger.
+retry do publisher, redrive por cinco entregas, publishers concorrentes, restart
+simulado e shutdown. Depois de cada cenário, saldo é comparado com ledger.
 
-Última validação registrada: `bun run test:integration` passou com 16 testes em
-09/11/2026 antes das mudanças posteriores de observabilidade e AuthGuard. Depois
-dessas mudanças, `bun run build` e `bun run lint` passaram; lint ainda aponta um
-aviso existente de `unbound-method` no teste de shutdown do worker. Os testes
-não simulam três processos do sistema operacional: são três instâncias Nest no
-mesmo processo. O crash/restart também é simulado fechando e recriando Nest.
+Última validação registrada antes desta revisão: `bun run test:integration`
+passou com 16 testes em 09/11/2026; depois, `bun run build` e `bun run lint`
+passaram. Nesta revisão foram adicionados casos com processos separados, retry
+do publisher e redrive após cinco entregas; registre abaixo o resultado da
+validação desta revisão quando executada. O caso de crash/restart continua
+simulado fechando e recriando Nest, não matando um processo do sistema
+operacional no intervalo exato entre commit e ACK.
 
 ## Limitações conhecidas / validações pendentes
 
@@ -162,13 +164,16 @@ mesmo processo. O crash/restart também é simulado fechando e recriando Nest.
 - Métricas são efêmeras e não há Prometheus server, scrape config, dashboard ou
   OpenTelemetry no Compose.
 - A política de DLQ para falha técnica depende de redrive SQS; o teste de
-  integração cobre envio explícito de mensagem inválida à DLQ, mas não valida
-  uma falha técnica repetida até cinco entregas.
-- Não foi injetada falha transitória específica do publisher para validar
-  backoff e incremento da tentativa; publishers concorrentes e publicação foram
-  exercitados.
-- As três aplicações concorrentes e o restart são testes de instâncias Nest,
-  não processos separados nem encerramento forçado do SO.
+  integração valida o redrive após cinco entregas. O teste não simula indisponibilidade
+  prolongada do broker nem verifica recuperação após processo morto pelo SO.
+- Três processos Bun separados agora exercitam submissões HTTP concorrentes;
+  o cenário de recuperação após commit e antes de ACK continua sendo uma
+  simulação via estado persistido e reinicialização da aplicação.
+- `WagerTransactionStatus.Failed` e a transição de domínio existem, mas o fluxo
+  de aplicação não os usa: erros técnicos abortam a transação para retry; erros
+  de contrato vão à DLQ e rejeições de negócio são `REJECTED`. Não há política
+  implementada para registrar uma falha permanente de infraestrutura como
+  transação `FAILED` auditável.
 - Outbox não tem máximo de tentativas nem DLQ própria; evento problemático pode
   permanecer pendente e elevar o lag até intervenção operacional.
 - Publisher envia mensagens da mesma batch com concorrência. SQS FIFO ordena pela
@@ -190,8 +195,8 @@ Scripts existentes: `bun run build`, `bun run lint`, `bun run test`,
 `bun run db:migrate:down`, `bun run db:migration:create` e
 `bun run db:migration:check`.
 
-## Estado Git ao atualizar este handoff
+## Estado Git
 
-As alterações de AuthGuard e desta atualização documental estão no working tree
-sem commit nesta observação. Não descartar alterações locais sem revisar
-`git status` e `git diff`.
+O estado do working tree muda durante o desenvolvimento e não é registrado
+neste handoff. Consulte `git status` e revise o diff atual antes de descartar ou
+commitar alterações.
